@@ -1,0 +1,9 @@
+- op: insert
+  path: /services?
+  id: dsh-research-lab
+  name: dsh-research-lab
+  insert:
+    - id: dsh-research-lab
+      name: "@snow-the/dsh-research-lab"
+  config:
+    bundle: "@snow-the/dsh-research-lab"

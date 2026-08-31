@@ -1,0 +1,336 @@
+/**
+ * dsh-research-lab — research lab toolkit for DSH.
+ * Inspirations: AutoSci (wiki-centric research), ASI-Bench (eval rigor),
+ * daily-arXiv-ai-enhanced (digest), ChatPaper (paper review),
+ * nature-skills / research-writing-skill (academic writing), Supervisor-Skills.
+ *  - rlab_wiki: write wiki pages (experiment/literature/decision/todo) + rebuild index
+ *  - rlab_bench: append eval rows to a per-project ledger, report with 口径 (protocol) warnings
+ *  - rlab_experiment: hypothesis → verdict → evidence loop pages (drives honest science)
+ *  - rlab_paper_review: arXiv id → structured adversarial review checklist
+ *  - rlab_arxiv_digest: keyword digest of recent arXiv papers → markdown file
+ *  - rlab_writing: academic-expression check on a text passage
+ *  - rlab_status: one-screen project state (wiki count, bench rows, open todos)
+ */
+import { defineTool } from '@deepseek-ai/dsh-tools';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { arxivByIds, arxivSearch, formatPapers, type Paper } from './arxiv.js';
+import {
+  appendBench, benchReport, listWiki, readBench, rebuildWikiIndex, rlabDir, writeWikiPage,
+  type BenchRow, type WikiKind,
+} from './store.js';
+
+const textOut = { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] };
+const today = () => new Date().toISOString().slice(0, 10);
+
+export const name = 'dsh-research-lab';
+export const inject = ['tools'];
+
+export async function apply(ctx: any) {
+  // ---------------- rlab_wiki ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_wiki',
+    description: 'Write a research-wiki page under <project>/.rlab/wiki/<kind>/ and rebuild the index (AutoSci-style durable lab notes). Kinds: experiment (what you ran), literature (paper notes), decision (why you chose X — ADRs), todo (open items). Pages are plain markdown; read them with the read tool. Returns the written path.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      kind: { type: 'string', required: true, description: 'experiment | literature | decision | todo' },
+      id: { type: 'string', required: true, description: 'short kebab id, e.g. m10-contrastive or arxiv-2602.04770' },
+      title: { type: 'string', required: true, description: 'page title' },
+      content: { type: 'string', required: true, description: 'markdown body' },
+      tags: { type: 'array', required: false, description: 'optional tags' },
+    },
+    output: textOut,
+    timeoutMs: 15000,
+    async execute(args: any) {
+      const kind = String(args?.kind ?? '') as WikiKind;
+      if (!['experiment', 'literature', 'decision', 'todo'].includes(kind)) throw new Error('kind must be experiment|literature|decision|todo');
+      const project = String(args?.project ?? '').trim();
+      const id = String(args?.id ?? '').trim();
+      if (!project || !id) throw new Error('project and id required');
+      const p = writeWikiPage(project, {
+        kind, id, title: String(args?.title ?? id), updated: today(),
+        content: String(args?.content ?? ''), tags: args?.tags as string[] | undefined,
+      });
+      const idx = rebuildWikiIndex(project);
+      return 'Wrote ' + p + '\nIndex: ' + idx;
+    },
+  }));
+
+  // ---------------- rlab_bench ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_bench',
+    description: 'Append one evaluation row to the per-project benchmark ledger (<project>/.rlab/bench.jsonl) and return the report. ASI-Bench-grade rigor: you MUST state metric, split and (for MTEB) hf_subset — the tool flags 口径 (protocol) mismatches, e.g. comparing test vs dev splits, which is the classic self-deception in ML papers.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      model: { type: 'string', required: true, description: 'model id, e.g. driftnet-m9 or potion-multilingual-128M' },
+      task: { type: 'string', required: true, description: 'task name, e.g. STS12 or MTEB-Multilingual-v2' },
+      score: { type: 'number', required: true, description: 'the metric value' },
+      metric: { type: 'string', required: true, description: 'cos_sim.spearman | ndcg_at_10 | accuracy | ...' },
+      split: { type: 'string', required: false, description: 'test | dev | validation (default test)' },
+      hf_subset: { type: 'string', required: false, description: 'huggingface subset when task has one' },
+      prompt_type: { type: 'string', required: false, description: 'e.g. query|passage, or none' },
+      seed: { type: 'number', required: false, description: 'seed if stochastic' },
+      note: { type: 'string', required: false, description: 'free note, e.g. "batch 128, fp32, compile off"' },
+    },
+    output: textOut,
+    timeoutMs: 10000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      const model = String(args?.model ?? '').trim();
+      const task = String(args?.task ?? '').trim();
+      const score = Number(args?.score);
+      if (!project || !model || !task || Number.isNaN(score)) throw new Error('project/model/task/score required');
+      const row: BenchRow = {
+        date: today(), model, task, score,
+        metric: String(args?.metric ?? 'score'),
+        split: String(args?.split ?? 'test'),
+        hf_subset: args?.hf_subset ? String(args.hf_subset) : undefined,
+        prompt_type: args?.prompt_type ? String(args.prompt_type) : undefined,
+        seed: args?.seed !== undefined ? Number(args.seed) : undefined,
+        note: args?.note ? String(args.note) : undefined,
+      };
+      appendBench(project, row);
+      return benchReport(project, model, task);
+    },
+  }));
+
+  // ---------------- rlab_experiment ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_experiment',
+    description: 'Write an experiment page with a verdict-driven structure (hypothesis → prediction → evidence → verdict → conclusion). This encodes the discipline we learned the hard way: every experiment states its decision rule BEFORE the run, and records negative results with the same weight as positive ones. Page goes to <project>/.rlab/wiki/experiment/<id>.md.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      id: { type: 'string', required: true, description: 'short kebab id, e.g. v4-permcons' },
+      hypothesis: { type: 'string', required: true, description: 'what you believed and why (with references)' },
+      prediction: { type: 'string', required: false, description: 'falsifiable prediction + decision rule, e.g. "STS12 >= 0.5 → mechanism works"' },
+      evidence: { type: 'string', required: true, description: 'what actually happened: numbers, logs, artifacts' },
+      verdict: { type: 'string', required: true, description: 'confirmed | refuted | inconclusive' },
+      conclusion: { type: 'string', required: true, description: 'what this changes for the project' },
+    },
+    output: textOut,
+    timeoutMs: 15000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      const id = String(args?.id ?? '').trim();
+      const verdict = String(args?.verdict ?? '');
+      if (!project || !id) throw new Error('project and id required');
+      if (!['confirmed', 'refuted', 'inconclusive'].includes(verdict)) throw new Error('verdict must be confirmed|refuted|inconclusive');
+      const body = [
+        '## Hypothesis', '', String(args?.hypothesis ?? ''), '',
+        '## Prediction / decision rule', '', String(args?.prediction ?? '(not stated — bad practice)'), '',
+        '## Evidence', '', String(args?.evidence ?? ''), '',
+        '## Verdict: **' + verdict.toUpperCase() + '**', '',
+        '## Conclusion', '', String(args?.conclusion ?? ''), '',
+      ].join('\n');
+      const p = writeWikiPage(project, { kind: 'experiment', id, title: id + ' — ' + verdict, updated: today(), content: body });
+      const idx = rebuildWikiIndex(project);
+      return 'Wrote ' + p + '\nIndex: ' + idx;
+    },
+  }));
+
+  // ---------------- rlab_paper_review ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_paper_review',
+    description: 'Pull an arXiv paper by id (or abs URL) and produce a structured adversarial review checklist (ChatPaper summary + ASI-Bench rigor): contribution, method, evidence strength, baseline fairness, flaws, reproducibility. The checklist is the same one you should apply to your OWN paper before submission.',
+    parameters: {
+      arxivId: { type: 'string', required: true, description: 'e.g. 2602.04770 or full https://arxiv.org/abs/2602.04770 URL' },
+      focus: { type: 'string', required: false, description: 'what to look for, e.g. "is the eval protocol sound?"' },
+      outputFile: { type: 'string', required: false, description: 'optional absolute path to write the review markdown' },
+    },
+    output: textOut,
+    timeoutMs: 60000,
+    async execute(args: any) {
+      const raw = String(args?.arxivId ?? '').trim();
+      const m = raw.match(/(\d{4}\.\d{4,5})(v\d+)?/);
+      if (!m) throw new Error('could not parse arXiv id from: ' + raw);
+      const papers = await arxivByIds([m[1]]);
+      if (!papers.length) throw new Error('paper not found: ' + m[1]);
+      const p = papers[0];
+      const focus = args?.focus ? String(args.focus) : '';
+      const lines = [
+        '# Review: ' + p.title,
+        '',
+        'arXiv: ' + p.id + '  |  ' + p.absUrl,
+        'Authors: ' + p.authors.join(', '),
+        'Published: ' + p.published.slice(0, 10) + (p.updated && p.updated !== p.published ? ' (updated ' + p.updated.slice(0, 10) + ')' : ''),
+        'Categories: ' + p.categories.join(', '),
+        '',
+        '## Abstract', '', p.summary, '',
+        focus ? '## Review focus: ' + focus + '' : '',
+        '',
+        '## Checklist (answer each)',
+        '',
+        '1. **Contribution** — what is new vs prior work? Is the novelty structural or incremental?',
+        '2. **Method** — is the method fully specified (hyperparams, data splits, compute)? Could you reimplement it from the text alone?',
+        '3. **Evidence strength** — are the reported numbers backed by: same eval protocol across baselines? error bars / seeds? statistical tests?',
+        '4. **Baseline fairness** — same preprocessing, same prompt templates, same split, same metric? Any cherry-picked subsets?',
+        '5. **Known failure modes** — contamination (eval data in training), leakage, train/test split integrity, metric misuse (e.g. Pearson vs Spearman, accuracy on imbalanced sets).',
+        '6. **Reproducibility** — code/data released? licenses? hardware and runtime reported?',
+        '7. **Claims vs evidence** — does every headline claim have a corresponding table/figure with the exact protocol?',
+        '8. **Missing experiments** — what ablation or control would you require before believing the central claim?',
+        '',
+        '## Verdict draft',
+        '',
+        '- [ ] Accept (strong evidence, sound protocol)',
+        '- [ ] Weak accept (interesting but under-verified)',
+        '- [ ] Borderline (fixable flaws: missing ablations, protocol gaps)',
+        '- [ ] Reject (fatal flaw: broken protocol, no baseline, claims exceed evidence)',
+        '',
+        '_Generated by dsh-research-lab — the checklist also applies to your own papers._',
+      ];
+      const text = lines.join('\n');
+      const outFile = args?.outputFile ? String(args.outputFile) : '';
+      if (outFile) {
+        fs.mkdirSync(path.dirname(path.resolve(outFile)), { recursive: true });
+        fs.writeFileSync(outFile, text + '\n', 'utf8');
+        return 'Review written to ' + outFile + '\n\n' + text;
+      }
+      return text;
+    },
+  }));
+
+  // ---------------- rlab_arxiv_digest ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_arxiv_digest',
+    description: 'Keyword digest of recent arXiv papers (daily-arXiv-ai-enhanced style). Searches export.arxiv.org for each query, dedupes, sorts by date, and writes a markdown digest under <project>/.rlab/digests/<date>.md. Use with rlab_wiki literature pages to build your reading queue.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      queries: { type: 'array', required: true, description: 'search terms, e.g. ["embedding distillation", "efficient retrieval"]' },
+      maxPerQuery: { type: 'number', required: false, description: 'papers per query (default 10, max 30)' },
+      withSummary: { type: 'boolean', required: false, description: 'include 500-char abstracts (default false)' },
+    },
+    output: textOut,
+    timeoutMs: 120000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      const queries: string[] = Array.isArray(args?.queries) ? args.queries.map(String).filter(Boolean) : [];
+      if (!project || !queries.length) throw new Error('project and queries required');
+      const max = Math.min(Number(args?.maxPerQuery) || 10, 30);
+      const withSummary = args?.withSummary === true;
+      const seen = new Set<string>();
+      const all: Paper[] = [];
+      for (const q of queries) {
+        try {
+          const papers = await arxivSearch(q, max);
+          for (const p of papers) {
+            if (seen.has(p.id)) continue;
+            seen.add(p.id);
+            all.push(p);
+          }
+        } catch (e) {
+          all.push({ id: 'ERR', title: 'query failed: ' + q + ' — ' + (e as Error).message, authors: [], published: '', updated: '', summary: '', categories: [], absUrl: '', pdfUrl: '' });
+        }
+      }
+      all.sort((a, b) => (b.published || '').localeCompare(a.published || ''));
+      const date = today();
+      const dir = path.join(rlabDir(project), 'digests');
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, date + '.md');
+      const lines = ['# arXiv digest — ' + date, '', 'queries: ' + queries.join(' | '), 'papers: ' + all.length, ''];
+      lines.push(formatPapers(all, withSummary));
+      fs.writeFileSync(file, lines.join('\n') + '\n', 'utf8');
+      return 'Digest written to ' + file + ' (' + all.length + ' papers)\n\n' + formatPapers(all.slice(0, 10), withSummary);
+    },
+  }));
+
+  // ---------------- rlab_writing ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_writing',
+    description: 'Academic-expression check on a passage (nature-skills / research-writing-skill style). Flags: passive-voice overuse, weak verbs (get/do/make/use), vague quantifiers (many/some/very), overlong sentences, filler phrases, and inconsistent terminology. Returns a line-anchored report with concrete rewrites.',
+    parameters: {
+      text: { type: 'string', required: true, description: 'the passage to check' },
+    },
+    output: textOut,
+    timeoutMs: 15000,
+    async execute(args: any) {
+      const text = String(args?.text ?? '').trim();
+      if (!text) throw new Error('text required');
+      const sentences = text.split(/(?<=[.!?])\s+/).filter(Boolean);
+      const weakVerbs = /\b(get|got|do|does|did|make|makes|made|use|uses|used|put|take|takes|took|show|shows|showed)\b/gi;
+      const vague = /\b(many|some|several|a lot of|lots of|very|really|quite|fairly|pretty|kind of|sort of|basically|essentially|important|interesting|significant)\b/gi;
+      const filler = /\b(in order to|due to the fact that|at this point in time|it is important to note that|as we all know|needless to say|it should be noted that)\b/gi;
+      const passive = /\b(was|were|is|are|been|being) \w+ed\b/gi;
+      const issues: string[] = [];
+      const seen = new Set<string>();
+      const push = (s: string) => { if (!seen.has(s)) { seen.add(s); issues.push(s); } };
+      for (let i = 0; i < sentences.length; i++) {
+        const s = sentences[i];
+        const words = s.split(/\s+/).length;
+        if (words > 40) push('S' + (i + 1) + ' [' + words + ' words] overlong sentence — split it: "' + s.slice(0, 90) + '…"');
+        const wv = s.match(weakVerbs);
+        if (wv) push('S' + (i + 1) + ' weak verb(s) ' + [...new Set(wv.map(x => x.toLowerCase()))].join(', ') + ' — prefer precise verbs: "' + s.slice(0, 80) + '"');
+        const vq = s.match(vague);
+        if (vq) push('S' + (i + 1) + ' vague quantifier(s) ' + [...new Set(vq.map(x => x.toLowerCase()))].join(', ') + ' — replace with numbers or drop: "' + s.slice(0, 80) + '"');
+        const fl = s.match(filler);
+        if (fl) push('S' + (i + 1) + ' filler: ' + fl[0].toLowerCase() + ' → "' + s.slice(0, 80) + '"');
+        const ps = s.match(passive);
+        if (ps && words > 12) push('S' + (i + 1) + ' passive ' + ps[0].toLowerCase() + ' — consider active voice: "' + s.slice(0, 80) + '"');
+      }
+      // terminology consistency: repeated capitalized terms with variants
+      const terms = text.match(/\b[A-Z][A-Za-z0-9_-]{2,}\b/g) || [];
+      const freq = new Map<string, number>();
+      for (const t of terms) freq.set(t, (freq.get(t) || 0) + 1);
+      const multi = [...freq.entries()].filter(([, n]) => n >= 3).map(([t]) => t);
+      const report = [
+        '# Writing check report',
+        '',
+        'Sentences: ' + sentences.length + ' | issues found: ' + issues.length,
+        '',
+        issues.length ? issues.map(x => '- ' + x).join('\n') : '- ✅ No common issues detected.',
+        '',
+        multi.length ? '## Repeated key terms (check spelling/consistency): ' + multi.join(', ') : '',
+        '',
+        '## Quick checklist',
+        '',
+        '- One idea per sentence; < 30 words ideal.',
+        '- Active voice: "we train" not "it was trained".',
+        '- Numbers over adjectives: "57% (n=1,204)" not "many".',
+        '- Define acronyms at first use; use ONE name per concept everywhere.',
+        '- Claim only what a table/figure with a stated protocol supports.',
+      ].join('\n');
+      return report;
+    },
+  }));
+
+  // ---------------- rlab_status ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_status',
+    description: 'One-screen state of a research project: wiki page counts per kind, benchmark ledger summary (models × tasks with latest scores), and open TODOs. Read this first when continuing work on a project.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+    },
+    output: textOut,
+    timeoutMs: 10000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      if (!project) throw new Error('project required');
+      const dir = rlabDir(project);
+      if (!fs.existsSync(dir)) return 'No .rlab/ directory at ' + project + ' yet. Start with rlab_wiki or rlab_bench.';
+      const pages = listWiki(project);
+      const count = (k: WikiKind) => pages.filter(p => p.kind === k).length;
+      const benchRows = readBench(project);
+      const todoPages = pages.filter(p => p.kind === 'todo');
+      const lines = [
+        '# Research status — ' + project,
+        '',
+        '## Wiki  (' + pages.length + ' pages)',
+        '- experiments: ' + count('experiment'),
+        '- literature: ' + count('literature'),
+        '- decisions: ' + count('decision'),
+        '- todo: ' + count('todo'),
+        '',
+        '## Bench (' + benchRows.length + ' rows)',
+        '',
+      ];
+      lines.push(benchReport(project));
+      lines.push('');
+      if (todoPages.length) {
+        lines.push('## Open TODOs');
+        for (const t of todoPages) lines.push('- ' + t.title + '  (' + t.id + ')');
+        lines.push('');
+      }
+      lines.push('_State dir: ' + dir + '_');
+      return lines.join('\n');
+    },
+  }));
+}
