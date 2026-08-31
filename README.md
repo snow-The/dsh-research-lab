@@ -17,6 +17,7 @@ experiments (hypothesis → verdict loops, eval 口径 discipline).
 | `rlab_paper_review` | arXiv id → adversarial 8-point review checklist (also applies to your own papers) | ChatPaper + ASI-Bench |
 | `rlab_arxiv_digest` | keyword digest of recent arXiv papers → `<project>/.rlab/digests/<date>.md` | daily-arXiv-ai-enhanced |
 | `rlab_writing` | line-anchored academic-expression check (passive/weak verbs/vague quantifiers/filler/term consistency) | nature-skills, research-writing-skill |
+| `rlab_related` | self-building keyword retrieval: NLP tokenization + SQLite FTS5, no preset lexicon — terms are TF-IDF-mined from your docs (EN words + ZH n-grams) and expanded iteratively (search → mine → merge → repeat) | hamuleite-style corpus, Rocchio relevance feedback |
 | `rlab_status` | one-screen project state: wiki counts, bench report, open TODOs | — |
 
 ## On-disk layout
@@ -29,6 +30,7 @@ experiments (hypothesis → verdict loops, eval 口径 discipline).
     literature/<id>.md  # paper notes (link from digests)
     decision/<id>.md    # ADRs: why you chose X
     todo/<id>.md        # open items
+  related.db           # FTS5 corpus + auto-built lexicon (rlab_related)
   bench.jsonl           # one eval row per line (JSON)
   digests/<date>.md     # arXiv digests
 ```

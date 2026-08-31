@@ -1,7 +1,7 @@
 // src/index.ts
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import * as fs2 from "node:fs";
-import * as path2 from "node:path";
+import * as fs3 from "node:fs";
+import * as path3 from "node:path";
 
 // src/arxiv.ts
 var esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -192,6 +192,310 @@ function benchReport(project, model, task) {
   return lines.join("\n");
 }
 
+// src/related.ts
+import { DatabaseSync } from "node:sqlite";
+import * as fs2 from "node:fs";
+import * as path2 from "node:path";
+var STOP = /* @__PURE__ */ new Set([
+  // en
+  "the",
+  "a",
+  "an",
+  "and",
+  "or",
+  "of",
+  "to",
+  "in",
+  "on",
+  "for",
+  "with",
+  "by",
+  "at",
+  "from",
+  "as",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "being",
+  "it",
+  "its",
+  "this",
+  "that",
+  "these",
+  "those",
+  "we",
+  "our",
+  "you",
+  "your",
+  "they",
+  "their",
+  "he",
+  "she",
+  "him",
+  "her",
+  "i",
+  "my",
+  "me",
+  "not",
+  "no",
+  "but",
+  "if",
+  "then",
+  "than",
+  "so",
+  "such",
+  "which",
+  "who",
+  "whom",
+  "what",
+  "when",
+  "where",
+  "why",
+  "how",
+  "all",
+  "any",
+  "both",
+  "each",
+  "few",
+  "more",
+  "most",
+  "other",
+  "some",
+  "can",
+  "could",
+  "may",
+  "might",
+  "must",
+  "shall",
+  "should",
+  "will",
+  "would",
+  "do",
+  "does",
+  "did",
+  "has",
+  "have",
+  "had",
+  "about",
+  "into",
+  "over",
+  "under",
+  "again",
+  "further",
+  "once",
+  "only",
+  "own",
+  "same",
+  "too",
+  "very",
+  "just",
+  "also",
+  "per",
+  "via",
+  // zh
+  "\u7684",
+  "\u4E86",
+  "\u548C",
+  "\u662F",
+  "\u5728",
+  "\u6709",
+  "\u4E0E",
+  "\u5C31",
+  "\u90FD",
+  "\u800C",
+  "\u53CA",
+  "\u6216",
+  "\u4E00\u4E2A",
+  "\u6211\u4EEC",
+  "\u4F60\u4EEC",
+  "\u4ED6\u4EEC",
+  "\u8FD9\u4E2A",
+  "\u90A3\u4E2A",
+  "\u8FD9\u4E9B",
+  "\u90A3\u4E9B",
+  "\u4E0D",
+  "\u6CA1\u6709",
+  "\u53EF\u4EE5",
+  "\u80FD\u591F",
+  "\u5E94\u8BE5",
+  "\u4F46\u662F",
+  "\u56E0\u4E3A",
+  "\u6240\u4EE5",
+  "\u5982\u679C",
+  "\u90A3\u4E48",
+  "\u5982\u4F55",
+  "\u4EC0\u4E48",
+  "\u4E3A\u4EC0\u4E48",
+  "\u600E\u4E48",
+  "\u4E2D",
+  "\u4E0A",
+  "\u4E0B",
+  "\u91CC",
+  "\u5BF9",
+  "\u4E3A",
+  "\u4E8E",
+  "\u4E4B",
+  "\u5176",
+  "\u88AB",
+  "\u628A",
+  "\u8BA9",
+  "\u5411",
+  "\u4ECE",
+  "\u5230",
+  "\u7B49",
+  "\u7B49",
+  "\u4EE5\u53CA",
+  "\u5176\u4E2D",
+  "\u4EE5\u53CA",
+  "\u5206\u522B",
+  "\u4E3B\u8981",
+  "\u76F8\u5173",
+  "\u57FA\u4E8E",
+  "\u8FDB\u884C",
+  "\u4F7F\u7528",
+  "\u901A\u8FC7",
+  "\u5BF9\u4E8E",
+  "\u5173\u4E8E",
+  "\u4E0D\u662F",
+  "\u5C31\u662F",
+  "\u8FD8\u662F",
+  "\u4EE5\u53CA"
+]);
+function dbPath(project) {
+  return path2.join(project, ".rlab", "related.db");
+}
+function openDb(project) {
+  const dir = path2.dirname(dbPath(project));
+  fs2.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(dbPath(project));
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS docs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      source TEXT DEFAULT '',
+      added TEXT DEFAULT (date('now'))
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(title, body, content='docs', content_rowid='id');
+    CREATE TABLE IF NOT EXISTS keywords (
+      term TEXT PRIMARY KEY,
+      score REAL NOT NULL DEFAULT 0,
+      freq INTEGER NOT NULL DEFAULT 0,
+      docs INTEGER NOT NULL DEFAULT 0,
+      last_seen TEXT DEFAULT (date('now'))
+    );
+    CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
+      INSERT INTO docs_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+    END;
+    CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+      INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', old.id, old.title, old.body);
+    END;
+  `);
+  return db;
+}
+function tokenize(text) {
+  const toks = [];
+  const latin = text.toLowerCase().match(/[a-z][a-z0-9_-]{1,}/g) || [];
+  toks.push(...latin);
+  const hanzi = text.match(/[\u4e00-\u9fff]+/g) || [];
+  for (const run of hanzi) {
+    const chars = [...run];
+    for (let i = 0; i < chars.length - 1; i++) {
+      const bigram = chars[i] + chars[i + 1];
+      if (i + 2 < chars.length) {
+        toks.push(chars[i] + chars[i + 1] + chars[i + 2]);
+      }
+      toks.push(bigram);
+    }
+  }
+  return toks.filter((t) => !STOP.has(t) && t.length > 1);
+}
+function ftsText(text) {
+  return tokenize(text).join(" ");
+}
+function mineKeywords(project, topN = 40) {
+  const db = openDb(project);
+  const n = db.prepare("SELECT COUNT(*) c FROM docs").get().c;
+  if (!n) return [];
+  const rows = db.prepare("SELECT id, title, body FROM docs").all();
+  const df = /* @__PURE__ */ new Map();
+  const tf = /* @__PURE__ */ new Map();
+  for (const r of rows) {
+    const toks = [...new Set(tokenize(r.title + " " + r.body))];
+    const seen = /* @__PURE__ */ new Set();
+    const all = tokenize(r.title + " " + r.title + " " + r.body);
+    for (const t of all) {
+      if (!tf.has(t)) tf.set(t, /* @__PURE__ */ new Map());
+      const m = tf.get(t);
+      m.set(r.id, (m.get(r.id) || 0) + 1);
+      if (!seen.has(t)) {
+        seen.add(t);
+        df.set(t, (df.get(t) || 0) + 1);
+      }
+    }
+  }
+  const idf = (t) => Math.log(1 + n / (1 + (df.get(t) || 0)));
+  const scored = [];
+  for (const [t, perDoc] of tf) {
+    let freq = 0;
+    for (const f of perDoc.values()) freq += f;
+    const score = freq / Math.max(1, perDoc.size) * idf(t);
+    scored.push({ term: t, score, freq, docs: perDoc.size, last_seen: "" });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const upsert = db.prepare(`INSERT INTO keywords(term, score, freq, docs) VALUES (?,?,?,?)
+    ON CONFLICT(term) DO UPDATE SET score=excluded.score, freq=excluded.freq, docs=excluded.docs, last_seen=date('now')`);
+  for (const k of scored.slice(0, topN * 3)) upsert.run(k.term, k.score, k.freq, k.docs);
+  return scored.slice(0, topN);
+}
+function search(project, query, k = 10) {
+  const db = openDb(project);
+  const q = ftsText(query).split(" ").filter(Boolean).slice(0, 12).join(" OR ");
+  if (!q) return [];
+  const rows = db.prepare(`
+    SELECT d.id, d.title, d.body, d.source, d.added, bm25(docs_fts) AS rank
+    FROM docs_fts JOIN docs d ON d.id = docs_fts.rowid
+    WHERE docs_fts MATCH ?
+    ORDER BY rank LIMIT ?
+  `).all(q, k);
+  return rows;
+}
+function addDoc(project, title, body, source) {
+  const db = openDb(project);
+  const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(title, ftsText(title + " " + body), source);
+  mineKeywords(project, 40);
+  return Number(r.lastInsertRowid);
+}
+function topKeywords(project, topN = 30) {
+  const db = openDb(project);
+  return db.prepare("SELECT term, score, freq, docs FROM keywords ORDER BY score DESC LIMIT ?").all(topN);
+}
+function expandSearch(project, seed, rounds = 2, k = 8) {
+  const db = openDb(project);
+  let query = seed;
+  const seenTerms = new Set(tokenize(seed));
+  const report = [];
+  let final = [];
+  for (let r = 1; r <= rounds; r++) {
+    const hits = search(project, query, k);
+    final = hits;
+    const toks = /* @__PURE__ */ new Map();
+    for (const h of hits) {
+      const t = tokenize(h.title + " " + h.title + " " + h.body.slice(0, 2e3));
+      for (const x of t) toks.set(x, (toks.get(x) || 0) + 1);
+    }
+    const newTerms = [...toks.entries()].filter(([t]) => !seenTerms.has(t)).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([t]) => t);
+    report.push({ round: r, newTerms, hits });
+    if (!newTerms.length) break;
+    for (const t of newTerms) seenTerms.add(t);
+    query = [query, ...newTerms].join(" OR ");
+  }
+  return { rounds: report, final, lexicon: topKeywords(project, 30) };
+}
+
 // src/index.ts
 var textOut = { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: String(v) }] };
 var today = () => (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
@@ -368,8 +672,8 @@ async function apply(ctx) {
       const text = lines.join("\n");
       const outFile = args?.outputFile ? String(args.outputFile) : "";
       if (outFile) {
-        fs2.mkdirSync(path2.dirname(path2.resolve(outFile)), { recursive: true });
-        fs2.writeFileSync(outFile, text + "\n", "utf8");
+        fs3.mkdirSync(path3.dirname(path3.resolve(outFile)), { recursive: true });
+        fs3.writeFileSync(outFile, text + "\n", "utf8");
         return "Review written to " + outFile + "\n\n" + text;
       }
       return text;
@@ -408,12 +712,12 @@ async function apply(ctx) {
       }
       all.sort((a, b) => (b.published || "").localeCompare(a.published || ""));
       const date = today();
-      const dir = path2.join(rlabDir(project), "digests");
-      fs2.mkdirSync(dir, { recursive: true });
-      const file = path2.join(dir, date + ".md");
+      const dir = path3.join(rlabDir(project), "digests");
+      fs3.mkdirSync(dir, { recursive: true });
+      const file = path3.join(dir, date + ".md");
       const lines = ["# arXiv digest \u2014 " + date, "", "queries: " + queries.join(" | "), "papers: " + all.length, ""];
       lines.push(formatPapers(all, withSummary));
-      fs2.writeFileSync(file, lines.join("\n") + "\n", "utf8");
+      fs3.writeFileSync(file, lines.join("\n") + "\n", "utf8");
       return "Digest written to " + file + " (" + all.length + " papers)\n\n" + formatPapers(all.slice(0, 10), withSummary);
     }
   }));
@@ -479,6 +783,74 @@ async function apply(ctx) {
     }
   }));
   ctx.tools.register(defineTool({
+    name: "rlab_related",
+    description: "Self-building keyword retrieval over a project document store (NLP + SQLite FTS5, zero deps). NO preset lexicon: terms are mined from the corpus via TF-IDF (English words + Chinese n-grams) and the lexicon grows with every added doc. Actions: add (index a doc), search (FTS5), expand (iterative relevance feedback: search \u2192 mine new terms from top hits \u2192 merge into query \u2192 repeat, rounds=1..4), keywords (show the auto-built lexicon), list (all docs). DB at <project>/.rlab/related.db.",
+    parameters: {
+      project: { type: "string", required: true, description: "absolute path to the research project root" },
+      action: { type: "string", required: true, description: "add | search | expand | keywords | list" },
+      title: { type: "string", required: false, description: "doc title (add)" },
+      body: { type: "string", required: false, description: "doc body/text (add)" },
+      source: { type: "string", required: false, description: "origin, e.g. arxiv:2602.04770 or file path (add)" },
+      query: { type: "string", required: false, description: "search query (search/expand), plain words, zh or en" },
+      k: { type: "number", required: false, description: "results per round (default 8, max 20)" },
+      rounds: { type: "number", required: false, description: "expansion rounds (default 2, max 4)" },
+      topN: { type: "number", required: false, description: "lexicon size for keywords (default 30)" }
+    },
+    output: textOut,
+    timeoutMs: 6e4,
+    async execute(args) {
+      const project = String(args?.project ?? "").trim();
+      const action = String(args?.action ?? "").trim();
+      if (!project || !action) throw new Error("project and action required");
+      const k = Math.min(Number(args?.k) || 8, 20);
+      const rounds = Math.min(Number(args?.rounds) || 2, 4);
+      const topN = Number(args?.topN) || 30;
+      const fmt = (ds) => ds.map((d) => "\u2022 [" + d.id + "] " + d.title + (d.source ? "  (" + d.source + ")" : "") + "  " + d.added + "\n  " + d.body.slice(0, 200).replace(/\n/g, " ")).join("\n");
+      switch (action) {
+        case "add": {
+          const title = String(args?.title ?? "").trim();
+          const body = String(args?.body ?? "").trim();
+          if (!title || !body) throw new Error("title and body required for add");
+          const id = addDoc(project, title, body, String(args?.source ?? ""));
+          const kw = mineKeywords(project, 15);
+          return "Indexed doc #" + id + ": " + title + "\nLexicon now " + kw.length + " top terms: " + kw.slice(0, 10).map((x) => x.term + "(" + x.score.toFixed(2) + ")").join(", ");
+        }
+        case "search": {
+          const q = String(args?.query ?? "").trim();
+          if (!q) throw new Error("query required for search");
+          const hits = search(project, q, k);
+          if (!hits.length) return "No hits for: " + q + "\nTry expand (iterative keyword mining) or add more docs.";
+          return "FTS5 hits (" + hits.length + ") for: " + q + "\n\n" + fmt(hits);
+        }
+        case "expand": {
+          const q = String(args?.query ?? "").trim();
+          if (!q) throw new Error("query required for expand");
+          const res = expandSearch(project, q, rounds, k);
+          const lines = ["Iterative expansion for: " + q + "  (rounds=" + res.rounds.length + ")", ""];
+          for (const rr of res.rounds) {
+            lines.push("round " + rr.round + ": " + rr.hits.length + " hits" + (rr.newTerms.length ? "  \u2192 mined new terms: " + rr.newTerms.join(", ") : "  \u2192 lexicon saturated"));
+          }
+          lines.push("", "## Final hits", fmt(res.final));
+          lines.push("", "## Auto-built lexicon (top " + res.lexicon.length + ")", res.lexicon.slice(0, 15).map((x) => x.term + "  score=" + x.score.toFixed(2) + " freq=" + x.freq + " docs=" + x.docs).join("\n"));
+          return lines.join("\n");
+        }
+        case "keywords": {
+          const kw = topKeywords(project, topN);
+          if (!kw.length) return "Lexicon empty \u2014 add docs first (rlab_related action=add).";
+          return "Auto-built lexicon (" + kw.length + "):\n" + kw.map((x) => x.term + "  score=" + x.score.toFixed(2) + " freq=" + x.freq + " docs=" + x.docs + "  seen=" + x.last_seen).join("\n");
+        }
+        case "list": {
+          const db = openDb(project);
+          const rows = db.prepare("SELECT id, title, source, added FROM docs ORDER BY id DESC LIMIT 50").all();
+          if (!rows.length) return "No docs indexed yet.";
+          return "Docs (" + rows.length + "):\n" + rows.map((x) => "\u2022 #" + x.id + " " + x.title + (x.source ? "  (" + x.source + ")" : "") + "  " + x.added).join("\n");
+        }
+        default:
+          throw new Error("action must be add|search|expand|keywords|list");
+      }
+    }
+  }));
+  ctx.tools.register(defineTool({
     name: "rlab_status",
     description: "One-screen state of a research project: wiki page counts per kind, benchmark ledger summary (models \xD7 tasks with latest scores), and open TODOs. Read this first when continuing work on a project.",
     parameters: {
@@ -490,7 +862,7 @@ async function apply(ctx) {
       const project = String(args?.project ?? "").trim();
       if (!project) throw new Error("project required");
       const dir = rlabDir(project);
-      if (!fs2.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
+      if (!fs3.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
       const pages = listWiki(project);
       const count = (k) => pages.filter((p) => p.kind === k).length;
       const benchRows = readBench(project);

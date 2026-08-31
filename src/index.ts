@@ -19,6 +19,7 @@ import {
   appendBench, benchReport, listWiki, readBench, rebuildWikiIndex, rlabDir, writeWikiPage,
   type BenchRow, type WikiKind,
 } from './store.js';
+import { addDoc, expandSearch, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
 
 const textOut = { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] };
 const today = () => new Date().toISOString().slice(0, 10);
@@ -289,6 +290,78 @@ export async function apply(ctx: any) {
         '- Claim only what a table/figure with a stated protocol supports.',
       ].join('\n');
       return report;
+    },
+  }));
+
+
+  // ---------------- rlab_related: self-building keyword retrieval ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_related',
+    description: 'Self-building keyword retrieval over a project document store (NLP + SQLite FTS5, zero deps). NO preset lexicon: terms are mined from the corpus via TF-IDF (English words + Chinese n-grams) and the lexicon grows with every added doc. Actions: add (index a doc), search (FTS5), expand (iterative relevance feedback: search → mine new terms from top hits → merge into query → repeat, rounds=1..4), keywords (show the auto-built lexicon), list (all docs). DB at <project>/.rlab/related.db.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      action: { type: 'string', required: true, description: 'add | search | expand | keywords | list' },
+      title: { type: 'string', required: false, description: 'doc title (add)' },
+      body: { type: 'string', required: false, description: 'doc body/text (add)' },
+      source: { type: 'string', required: false, description: 'origin, e.g. arxiv:2602.04770 or file path (add)' },
+      query: { type: 'string', required: false, description: 'search query (search/expand), plain words, zh or en' },
+      k: { type: 'number', required: false, description: 'results per round (default 8, max 20)' },
+      rounds: { type: 'number', required: false, description: 'expansion rounds (default 2, max 4)' },
+      topN: { type: 'number', required: false, description: 'lexicon size for keywords (default 30)' },
+    },
+    output: textOut,
+    timeoutMs: 60000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      const action = String(args?.action ?? '').trim();
+      if (!project || !action) throw new Error('project and action required');
+      const k = Math.min(Number(args?.k) || 8, 20);
+      const rounds = Math.min(Number(args?.rounds) || 2, 4);
+      const topN = Number(args?.topN) || 30;
+      const fmt = (ds: RelatedDoc[]) => ds.map(d =>
+        '• [' + d.id + '] ' + d.title + (d.source ? '  (' + d.source + ')' : '') + '  ' + d.added + '\n  ' + d.body.slice(0, 200).replace(/\n/g, ' ')).join('\n');
+      switch (action) {
+        case 'add': {
+          const title = String(args?.title ?? '').trim();
+          const body = String(args?.body ?? '').trim();
+          if (!title || !body) throw new Error('title and body required for add');
+          const id = addDoc(project, title, body, String(args?.source ?? ''));
+          const kw = mineKeywords(project, 15);
+          return 'Indexed doc #' + id + ': ' + title + '\nLexicon now ' + kw.length + ' top terms: ' + kw.slice(0, 10).map(x => x.term + '(' + x.score.toFixed(2) + ')').join(', ');
+        }
+        case 'search': {
+          const q = String(args?.query ?? '').trim();
+          if (!q) throw new Error('query required for search');
+          const hits = search(project, q, k);
+          if (!hits.length) return 'No hits for: ' + q + '\nTry expand (iterative keyword mining) or add more docs.';
+          return 'FTS5 hits (' + hits.length + ') for: ' + q + '\n\n' + fmt(hits);
+        }
+        case 'expand': {
+          const q = String(args?.query ?? '').trim();
+          if (!q) throw new Error('query required for expand');
+          const res = expandSearch(project, q, rounds, k);
+          const lines = ['Iterative expansion for: ' + q + '  (rounds=' + res.rounds.length + ')', ''];
+          for (const rr of res.rounds) {
+            lines.push('round ' + rr.round + ': ' + rr.hits.length + ' hits' + (rr.newTerms.length ? '  → mined new terms: ' + rr.newTerms.join(', ') : '  → lexicon saturated') );
+          }
+          lines.push('', '## Final hits', fmt(res.final));
+          lines.push('', '## Auto-built lexicon (top ' + res.lexicon.length + ')', res.lexicon.slice(0, 15).map(x => x.term + '  score=' + x.score.toFixed(2) + ' freq=' + x.freq + ' docs=' + x.docs).join('\n'));
+          return lines.join('\n');
+        }
+        case 'keywords': {
+          const kw = topKeywords(project, topN);
+          if (!kw.length) return 'Lexicon empty — add docs first (rlab_related action=add).';
+          return 'Auto-built lexicon (' + kw.length + '):\n' + kw.map(x => x.term + '  score=' + x.score.toFixed(2) + ' freq=' + x.freq + ' docs=' + x.docs + '  seen=' + x.last_seen).join('\n');
+        }
+        case 'list': {
+          const db = openDb(project);
+          const rows = db.prepare('SELECT id, title, source, added FROM docs ORDER BY id DESC LIMIT 50').all() as { id: number; title: string; source: string; added: string }[];
+          if (!rows.length) return 'No docs indexed yet.';
+          return 'Docs (' + rows.length + '):\n' + rows.map(x => '• #' + x.id + ' ' + x.title + (x.source ? '  (' + x.source + ')' : '') + '  ' + x.added).join('\n');
+        }
+        default:
+          throw new Error('action must be add|search|expand|keywords|list');
+      }
     },
   }));
 
