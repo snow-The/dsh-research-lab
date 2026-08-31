@@ -19,7 +19,10 @@ import {
   appendBench, benchReport, listWiki, readBench, rebuildWikiIndex, rlabDir, writeWikiPage,
   type BenchRow, type WikiKind,
 } from './store.js';
-import { addDoc, expandSearch, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
+import { addDoc, expandSearch, hybridSearch, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
+import { rewriteReport } from './rewrite.js';
+import { addClaims, betaConfidence, citeClaim, claimsReport, extractClaims, loadClaims } from './extract.js';
+import { suggestExternal, suggestZh } from './suggest.js';
 
 const textOut = { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] };
 const today = () => new Date().toISOString().slice(0, 10);
@@ -294,6 +297,74 @@ export async function apply(ctx: any) {
   }));
 
 
+
+  // ---------------- rlab_rewrite: deterministic writing rewrite engine ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_rewrite',
+    description: 'Deterministic academic-writing rewrite engine (w-engine rules.ts spirit): applies ~10 curated rules — filler deletion (in order to→to, due to the fact that→because), weak verbs (get→obtain, make→produce, use→employ), passive "was X-ed by Y"→active, nominalizations, vague hedges. Returns before/after + per-rule hit counts. Offline, predictable, cheaper than LLM polishing.',
+    parameters: {
+      text: { type: 'string', required: true, description: 'the passage to rewrite' },
+    },
+    output: textOut,
+    timeoutMs: 10000,
+    async execute(args: any) {
+      const text = String(args?.text ?? '').trim();
+      if (!text) throw new Error('text required');
+      return rewriteReport(text);
+    },
+  }));
+
+
+  // ---------------- rlab_claim: claim extraction + evidence confidence ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_claim',
+    description: 'Claim ledger with evidence confidence (w8 knowledge.ts/betaConfidence spirit). extract: pull structured claims (contribution/result/comparison — en+zh templates) from text or an indexed doc and append to <project>/.rlab/claims.jsonl with beta-posterior confidence (prior 0.5, weight 100). cite: increment citations of a claim → confidence rises. list: show the ledger. This is the evidence backbone for Related Work claims in your paper.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      action: { type: 'string', required: true, description: 'extract | cite | list' },
+      text: { type: 'string', required: false, description: 'paper text to extract from (action=extract)' },
+      docId: { type: 'number', required: false, description: 'indexed doc id to extract from (action=extract)' },
+      claimId: { type: 'number', required: false, description: 'claim id to cite (action=cite)' },
+      type: { type: 'string', required: false, description: 'filter list by claim type' },
+    },
+    output: textOut,
+    timeoutMs: 20000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      const action = String(args?.action ?? '').trim();
+      if (!project || !action) throw new Error('project and action required');
+      switch (action) {
+        case 'extract': {
+          let docId = 0;
+          let textArg = String(args?.text ?? '');
+          if (args?.docId !== undefined) {
+            docId = Number(args.docId);
+            const db = openDb(project);
+            const row = db.prepare('SELECT title, body FROM docs WHERE id=?').get(docId) as { title: string; body: string } | undefined;
+            if (!row) throw new Error('doc #' + docId + ' not found — index it with rlab_related action=add first');
+            textArg = row.title + ' ' + row.body;
+          }
+          if (!textArg.trim()) throw new Error('text or docId required');
+          const added = addClaims(project, docId, textArg);
+          if (!added.length) return 'No claims matched the templates in this text. Templates: "we propose/present X", "achieves Y on Z", "outperforms W by V" (en+zh).';
+          return 'Extracted ' + added.length + ' claims (confidences beta(0.5, cited=0)):\n\n' +
+            added.map(c => '[' + c.id + '] ' + c.type.toUpperCase() + ' conf=' + c.confidence.toFixed(3) + '\n  subject: ' + (c.subject || '—') + (c.value ? '  value: ' + c.value : '') + (c.task ? '  on: ' + c.task : '')).join('\n');
+        }
+        case 'cite': {
+          const claimId = Number(args?.claimId);
+          if (!claimId) throw new Error('claimId required');
+          const c = citeClaim(project, claimId);
+          if (!c) throw new Error('claim #' + claimId + ' not found');
+          return 'Cited claim #' + claimId + ' — confidence ' + c.confidence.toFixed(4) + ' (cited=' + c.cited + '). beta posterior rises with each citation.';
+        }
+        case 'list':
+          return claimsReport(project, args?.type ? String(args.type) : undefined);
+        default:
+          throw new Error('action must be extract|cite|list');
+      }
+    },
+  }));
+
   // ---------------- rlab_related: self-building keyword retrieval ----------------
   ctx.tools.register(defineTool({
     name: 'rlab_related',
@@ -307,6 +378,7 @@ export async function apply(ctx: any) {
       query: { type: 'string', required: false, description: 'search query (search/expand), plain words, zh or en' },
       k: { type: 'number', required: false, description: 'results per round (default 8, max 20)' },
       rounds: { type: 'number', required: false, description: 'expansion rounds (default 2, max 4)' },
+      external: { type: 'boolean', required: false, description: 'also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)' },
       topN: { type: 'number', required: false, description: 'lexicon size for keywords (default 30)' },
     },
     output: textOut,
@@ -339,7 +411,16 @@ export async function apply(ctx: any) {
         case 'expand': {
           const q = String(args?.query ?? '').trim();
           if (!q) throw new Error('query required for expand');
-          const res = expandSearch(project, q, rounds, k);
+          let res = expandSearch(project, q, rounds, k);
+          if (args?.external === true) {
+            const ext = (await suggestExternal(q, 4)).concat(await suggestZh(q, 4));
+            const extTerms = ext.map(e => e.term + '[' + e.source + ']').join(', ');
+            if (ext.length) {
+              const extHits = hybridSearch(project, ext.map(e => e.term).join(' OR '), k);
+              res = { ...res, rounds: res.rounds.concat([{ round: res.rounds.length + 1, newTerms: ext.map(e => e.term), hits: extHits }]), final: extHits.length ? extHits : res.final };
+            }
+            return 'Iterative expansion (with external suggestions): ' + q + '\n  external terms: ' + (ext.length ? extTerms : '(none — offline?)') + '\n\n' + fmt(res.final);
+          }
           const lines = ['Iterative expansion for: ' + q + '  (rounds=' + res.rounds.length + ')', ''];
           for (const rr of res.rounds) {
             lines.push('round ' + rr.round + ': ' + rr.hits.length + ' hits' + (rr.newTerms.length ? '  → mined new terms: ' + rr.newTerms.join(', ') : '  → lexicon saturated') );

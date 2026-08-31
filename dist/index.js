@@ -1,7 +1,7 @@
 // src/index.ts
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import * as fs3 from "node:fs";
-import * as path3 from "node:path";
+import * as fs4 from "node:fs";
+import * as path4 from "node:path";
 
 // src/arxiv.ts
 var esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -546,6 +546,229 @@ function expandSearch(project, seed, rounds = 2, k = 8) {
   return { rounds: report, final, lexicon: topKeywords(project, 30) };
 }
 
+// src/rewrite.ts
+var RULES = [
+  {
+    name: "filler-in-order-to",
+    pattern: /\bin order to\b/gi,
+    replace: () => "to",
+    reason: 'filler "in order to" \u2192 "to"'
+  },
+  {
+    name: "filler-due-to-the-fact",
+    pattern: /\bdue to the fact that\b/gi,
+    replace: () => "because",
+    reason: 'filler "due to the fact that" \u2192 "because"'
+  },
+  {
+    name: "filler-it-should-be-noted",
+    pattern: /\bit (?:should be|is) (?:also )?noted that\b/gi,
+    replace: () => "",
+    reason: 'filler "it should be noted that" \u2192 delete'
+  },
+  {
+    name: "weak-get",
+    pattern: /\bget(s|ting|t)?\b/gi,
+    replace: (m) => m[1] ? "obtain" : "obtain",
+    reason: "weak verb get \u2192 obtain"
+  },
+  {
+    name: "weak-make",
+    pattern: /\bmake(s|ing)?\b/gi,
+    replace: (m) => m[1] ? "produce" : "produce",
+    reason: "weak verb make \u2192 produce"
+  },
+  {
+    name: "weak-use",
+    pattern: /\buse(s|d|ing)?\b/gi,
+    replace: () => "employ",
+    reason: "weak verb use \u2192 employ (academic register)"
+  },
+  {
+    name: "passive-by",
+    pattern: /\b([A-Z][\w\s-]{0,20}?)\s+(was|were) (\w+ed) by ([A-Z][\w\s]+?)(?=[\.\,]|$)/gi,
+    replace: (m) => {
+      const s = m[4].trim();
+      return s.charAt(0).toUpperCase() + s.slice(1) + " " + m[3];
+    },
+    reason: 'passive "was X-ed by Y" \u2192 active "Y X-ed"'
+  },
+  {
+    name: "nominalization",
+    pattern: /\b(performed|carried out|conducted) an? (experiment|study|analysis)\b/gi,
+    replace: (m) => m[2] + " (as verb: " + (m[1].startsWith("perf") ? "experimented" : "studied") + ")",
+    reason: "nominalization \u2192 verb form"
+  },
+  {
+    name: "hedge-very",
+    pattern: /\bvery (important|significant|large|small|good)\b/gi,
+    replace: () => "markedly",
+    reason: 'vague "very X" \u2192 precise "markedly"'
+  },
+  {
+    name: "quantifier-many",
+    pattern: /\ba (large )?number of\b/gi,
+    replace: () => "many",
+    reason: 'wordy "a (large) number of" \u2192 "many"'
+  }
+];
+function rewriteText(text) {
+  let cur = text;
+  const applied = [];
+  for (const rule of RULES) {
+    const before = cur;
+    cur = cur.replace(rule.pattern, (...args) => {
+      const m = args;
+      return rule.replace(m);
+    });
+    const count = (before.match(new RegExp(rule.pattern.source, rule.pattern.flags)) || []).length;
+    if (count > 0) applied.push({ name: rule.name, reason: rule.reason, count });
+  }
+  return { before: text, after: cur, applied };
+}
+function rewriteReport(text) {
+  const r = rewriteText(text);
+  const lines = ["# Rewrite report", "", "## Applied rules (" + r.applied.length + ")"];
+  for (const a2 of r.applied) lines.push("- " + a2.name + " \xD7" + a2.count + " \u2014 " + a2.reason);
+  if (!r.applied.length) lines.push("- (none \u2014 text is clean)");
+  lines.push("", "## After", "", r.after, "", "## Diff (before \u2192 after)");
+  const b = r.before.split("\n");
+  const a = r.after.split("\n");
+  for (let i = 0; i < Math.max(b.length, a.length); i++) {
+    if (b[i] !== a[i]) lines.push("- " + (b[i] ?? "").trim() + "  \u2192  " + (a[i] ?? "").trim());
+  }
+  return lines.join("\n");
+}
+
+// src/extract.ts
+import * as fs3 from "node:fs";
+import * as path3 from "node:path";
+function betaConfidence(prior, cited, weight = 100) {
+  return (prior * weight + cited) / (weight + cited);
+}
+var TEMPLATES = [
+  {
+    type: "contribution",
+    re: /we (propose|present|introduce|design|develop) ([A-Z][\w\s-]{3,60}?)(?:,| for| to| which| that| \.)/gi,
+    pick: (m) => ({ subject: m[2].trim() })
+  },
+  {
+    type: "contribution",
+    re: /本(文|工作)(提出|设计|介绍|开发)(了)?([\u4e00-\u9fff\w\s-]{3,60}?)(?:[,。]|用于|用以|使用|使|针对|$)/gi,
+    pick: (m) => ({ subject: (m[4] || "").trim() })
+  },
+  {
+    type: "result",
+    re: /(achieves|reaches|attains|obtains) ([\d.]+[%x]?) (?:on|in) ([\w\s-]{2,40}?)(?:[,.]| and | while |$)/gi,
+    pick: (m) => ({ subject: "result", value: m[2].trim(), task: m[3].trim() })
+  },
+  {
+    type: "result",
+    re: /(?:达到|获得|取得)(了)?([\d.]+[%x]?)(?:的)?(?:成绩|结果|分数|效果)?(?:在|于)?([\u4e00-\u9fff\w\s-]{2,40}?)(?:[,。]|$)/gi,
+    pick: (m) => ({ subject: "result", value: m[2].trim(), task: m[3].trim() })
+  },
+  {
+    type: "comparison",
+    re: /outperforms? ([\w\s-]{2,40}?) by ([\d.]+[%x]?)/gi,
+    pick: (m) => ({ subject: m[1].trim(), value: m[2].trim() })
+  },
+  {
+    type: "comparison",
+    re: /优于([\u4e00-\u9fff\w\s-]{2,40}?)(?:约|大约)?([\d.]+[%x]?)/gi,
+    pick: (m) => ({ subject: m[1].trim(), value: m[2].trim() })
+  }
+];
+function extractClaims(text) {
+  const claims = [];
+  for (const t of TEMPLATES) {
+    const re = new RegExp(t.re.source, t.re.flags.includes("g") ? t.re.flags : t.re.flags + "g");
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      try {
+        const p = t.pick(m);
+        claims.push({ type: t.type, ...p, context: text.slice(Math.max(0, m.index - 60), m.index + m[0].length + 60).replace(/\s+/g, " ").trim() });
+      } catch {
+      }
+      if (m.index === re.lastIndex) re.lastIndex++;
+    }
+  }
+  return claims;
+}
+var claimsFile = (project) => path3.join(project, ".rlab", "claims.jsonl");
+function loadClaims(project) {
+  try {
+    const lines = fs3.readFileSync(claimsFile(project), "utf8").split("\n").filter(Boolean);
+    return lines.map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+function addClaims(project, docId, text) {
+  const existing = loadClaims(project);
+  let nextId = existing.length ? Math.max(...existing.map((c) => c.id)) + 1 : 1;
+  const fresh = extractClaims(text);
+  const prior = 0.5;
+  const added = [];
+  fs3.mkdirSync(path3.dirname(claimsFile(project)), { recursive: true });
+  for (const c of fresh) {
+    const claim = { id: nextId++, docId, ...c, cited: 0, confidence: betaConfidence(prior, 0), date: (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) };
+    fs3.appendFileSync(claimsFile(project), JSON.stringify(claim) + "\n", "utf8");
+    added.push(claim);
+  }
+  return added;
+}
+function citeClaim(project, claimId, weight = 100) {
+  const claims = loadClaims(project);
+  const c = claims.find((x) => x.id === claimId);
+  if (!c) return null;
+  c.cited += 1;
+  c.confidence = betaConfidence(0.5, c.cited, weight);
+  fs3.writeFileSync(claimsFile(project), claims.map((x) => JSON.stringify(x)).join("\n") + "\n", "utf8");
+  return c;
+}
+function claimsReport(project, type) {
+  const claims = loadClaims(project);
+  if (!claims.length) return "No claims recorded yet. Use rlab_claim action=extract.";
+  const rows = type ? claims.filter((c) => c.type === type) : claims;
+  const lines = ["# Claim ledger \u2014 " + project + " (" + rows.length + " claims)", ""];
+  for (const c of rows) {
+    lines.push("[" + c.id + "] " + c.type.toUpperCase() + "  conf=" + c.confidence.toFixed(3) + " cited=" + c.cited);
+    if (c.subject) lines.push("  subject: " + c.subject);
+    if (c.value) lines.push("  value: " + c.value + (c.task ? "  on: " + c.task : ""));
+    lines.push('  ctx: "' + c.context.slice(0, 140) + '"');
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// src/suggest.ts
+async function suggestExternal(query, max = 5) {
+  const out = [];
+  try {
+    const url = "https://en.wikipedia.org/w/api.php?action=opensearch&format=json&limit=" + max + "&search=" + encodeURIComponent(query);
+    const res = await fetch(url, { headers: { "User-Agent": "dsh-research-lab/0.1" }, signal: AbortSignal.timeout(8e3) });
+    if (!res.ok) return out;
+    const data = await res.json();
+    const terms = data[1] || [];
+    for (const t of terms) out.push({ term: t, source: "wikipedia" });
+  } catch {
+  }
+  return out;
+}
+async function suggestZh(query, max = 5) {
+  const out = [];
+  try {
+    const url = "https://zh.wikipedia.org/w/api.php?action=opensearch&format=json&limit=" + max + "&search=" + encodeURIComponent(query);
+    const res = await fetch(url, { headers: { "User-Agent": "dsh-research-lab/0.1" }, signal: AbortSignal.timeout(8e3) });
+    if (!res.ok) return out;
+    const data = await res.json();
+    const terms = data[1] || [];
+    for (const t of terms) out.push({ term: t, source: "wikipedia-zh" });
+  } catch {
+  }
+  return out;
+}
+
 // src/index.ts
 var textOut = { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: String(v) }] };
 var today = () => (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
@@ -722,8 +945,8 @@ async function apply(ctx) {
       const text = lines.join("\n");
       const outFile = args?.outputFile ? String(args.outputFile) : "";
       if (outFile) {
-        fs3.mkdirSync(path3.dirname(path3.resolve(outFile)), { recursive: true });
-        fs3.writeFileSync(outFile, text + "\n", "utf8");
+        fs4.mkdirSync(path4.dirname(path4.resolve(outFile)), { recursive: true });
+        fs4.writeFileSync(outFile, text + "\n", "utf8");
         return "Review written to " + outFile + "\n\n" + text;
       }
       return text;
@@ -762,12 +985,12 @@ async function apply(ctx) {
       }
       all.sort((a, b) => (b.published || "").localeCompare(a.published || ""));
       const date = today();
-      const dir = path3.join(rlabDir(project), "digests");
-      fs3.mkdirSync(dir, { recursive: true });
-      const file = path3.join(dir, date + ".md");
+      const dir = path4.join(rlabDir(project), "digests");
+      fs4.mkdirSync(dir, { recursive: true });
+      const file = path4.join(dir, date + ".md");
       const lines = ["# arXiv digest \u2014 " + date, "", "queries: " + queries.join(" | "), "papers: " + all.length, ""];
       lines.push(formatPapers(all, withSummary));
-      fs3.writeFileSync(file, lines.join("\n") + "\n", "utf8");
+      fs4.writeFileSync(file, lines.join("\n") + "\n", "utf8");
       return "Digest written to " + file + " (" + all.length + " papers)\n\n" + formatPapers(all.slice(0, 10), withSummary);
     }
   }));
@@ -833,6 +1056,67 @@ async function apply(ctx) {
     }
   }));
   ctx.tools.register(defineTool({
+    name: "rlab_rewrite",
+    description: 'Deterministic academic-writing rewrite engine (w-engine rules.ts spirit): applies ~10 curated rules \u2014 filler deletion (in order to\u2192to, due to the fact that\u2192because), weak verbs (get\u2192obtain, make\u2192produce, use\u2192employ), passive "was X-ed by Y"\u2192active, nominalizations, vague hedges. Returns before/after + per-rule hit counts. Offline, predictable, cheaper than LLM polishing.',
+    parameters: {
+      text: { type: "string", required: true, description: "the passage to rewrite" }
+    },
+    output: textOut,
+    timeoutMs: 1e4,
+    async execute(args) {
+      const text = String(args?.text ?? "").trim();
+      if (!text) throw new Error("text required");
+      return rewriteReport(text);
+    }
+  }));
+  ctx.tools.register(defineTool({
+    name: "rlab_claim",
+    description: "Claim ledger with evidence confidence (w8 knowledge.ts/betaConfidence spirit). extract: pull structured claims (contribution/result/comparison \u2014 en+zh templates) from text or an indexed doc and append to <project>/.rlab/claims.jsonl with beta-posterior confidence (prior 0.5, weight 100). cite: increment citations of a claim \u2192 confidence rises. list: show the ledger. This is the evidence backbone for Related Work claims in your paper.",
+    parameters: {
+      project: { type: "string", required: true, description: "absolute path to the research project root" },
+      action: { type: "string", required: true, description: "extract | cite | list" },
+      text: { type: "string", required: false, description: "paper text to extract from (action=extract)" },
+      docId: { type: "number", required: false, description: "indexed doc id to extract from (action=extract)" },
+      claimId: { type: "number", required: false, description: "claim id to cite (action=cite)" },
+      type: { type: "string", required: false, description: "filter list by claim type" }
+    },
+    output: textOut,
+    timeoutMs: 2e4,
+    async execute(args) {
+      const project = String(args?.project ?? "").trim();
+      const action = String(args?.action ?? "").trim();
+      if (!project || !action) throw new Error("project and action required");
+      switch (action) {
+        case "extract": {
+          let docId = 0;
+          let textArg = String(args?.text ?? "");
+          if (args?.docId !== void 0) {
+            docId = Number(args.docId);
+            const db = openDb(project);
+            const row = db.prepare("SELECT title, body FROM docs WHERE id=?").get(docId);
+            if (!row) throw new Error("doc #" + docId + " not found \u2014 index it with rlab_related action=add first");
+            textArg = row.title + " " + row.body;
+          }
+          if (!textArg.trim()) throw new Error("text or docId required");
+          const added = addClaims(project, docId, textArg);
+          if (!added.length) return 'No claims matched the templates in this text. Templates: "we propose/present X", "achieves Y on Z", "outperforms W by V" (en+zh).';
+          return "Extracted " + added.length + " claims (confidences beta(0.5, cited=0)):\n\n" + added.map((c) => "[" + c.id + "] " + c.type.toUpperCase() + " conf=" + c.confidence.toFixed(3) + "\n  subject: " + (c.subject || "\u2014") + (c.value ? "  value: " + c.value : "") + (c.task ? "  on: " + c.task : "")).join("\n");
+        }
+        case "cite": {
+          const claimId = Number(args?.claimId);
+          if (!claimId) throw new Error("claimId required");
+          const c = citeClaim(project, claimId);
+          if (!c) throw new Error("claim #" + claimId + " not found");
+          return "Cited claim #" + claimId + " \u2014 confidence " + c.confidence.toFixed(4) + " (cited=" + c.cited + "). beta posterior rises with each citation.";
+        }
+        case "list":
+          return claimsReport(project, args?.type ? String(args.type) : void 0);
+        default:
+          throw new Error("action must be extract|cite|list");
+      }
+    }
+  }));
+  ctx.tools.register(defineTool({
     name: "rlab_related",
     description: "Self-building keyword retrieval over a project document store (NLP + SQLite FTS5, zero deps). NO preset lexicon: terms are mined from the corpus via TF-IDF (English words + Chinese n-grams) and the lexicon grows with every added doc. Actions: add (index a doc), search (FTS5), expand (iterative relevance feedback: search \u2192 mine new terms from top hits \u2192 merge into query \u2192 repeat, rounds=1..4), keywords (show the auto-built lexicon), list (all docs). DB at <project>/.rlab/related.db.",
     parameters: {
@@ -844,6 +1128,7 @@ async function apply(ctx) {
       query: { type: "string", required: false, description: "search query (search/expand), plain words, zh or en" },
       k: { type: "number", required: false, description: "results per round (default 8, max 20)" },
       rounds: { type: "number", required: false, description: "expansion rounds (default 2, max 4)" },
+      external: { type: "boolean", required: false, description: "also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)" },
       topN: { type: "number", required: false, description: "lexicon size for keywords (default 30)" }
     },
     output: textOut,
@@ -875,7 +1160,16 @@ async function apply(ctx) {
         case "expand": {
           const q = String(args?.query ?? "").trim();
           if (!q) throw new Error("query required for expand");
-          const res = expandSearch(project, q, rounds, k);
+          let res = expandSearch(project, q, rounds, k);
+          if (args?.external === true) {
+            const ext = (await suggestExternal(q, 4)).concat(await suggestZh(q, 4));
+            const extTerms = ext.map((e) => e.term + "[" + e.source + "]").join(", ");
+            if (ext.length) {
+              const extHits = hybridSearch(project, ext.map((e) => e.term).join(" OR "), k);
+              res = { ...res, rounds: res.rounds.concat([{ round: res.rounds.length + 1, newTerms: ext.map((e) => e.term), hits: extHits }]), final: extHits.length ? extHits : res.final };
+            }
+            return "Iterative expansion (with external suggestions): " + q + "\n  external terms: " + (ext.length ? extTerms : "(none \u2014 offline?)") + "\n\n" + fmt(res.final);
+          }
           const lines = ["Iterative expansion for: " + q + "  (rounds=" + res.rounds.length + ")", ""];
           for (const rr of res.rounds) {
             lines.push("round " + rr.round + ": " + rr.hits.length + " hits" + (rr.newTerms.length ? "  \u2192 mined new terms: " + rr.newTerms.join(", ") : "  \u2192 lexicon saturated"));
@@ -912,7 +1206,7 @@ async function apply(ctx) {
       const project = String(args?.project ?? "").trim();
       if (!project) throw new Error("project required");
       const dir = rlabDir(project);
-      if (!fs3.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
+      if (!fs4.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
       const pages = listWiki(project);
       const count = (k) => pages.filter((p) => p.kind === k).length;
       const benchRows = readBench(project);
