@@ -17,7 +17,12 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 export async function arxivQuery(params: Record<string, string>): Promise<Paper[]> {
   const qs = new URLSearchParams(params).toString();
   const url = 'https://export.arxiv.org/api/query?' + qs;
-  const res = await fetch(url, { headers: { 'User-Agent': 'dsh-research-lab/0.1' }, signal: AbortSignal.timeout(30000) });
+  const fetchOne = () => fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (dsh-research-lab/0.1)' }, signal: AbortSignal.timeout(30000) });
+  let res = await fetchOne();
+  if (res.status === 429) { // rate limited — one retry after backoff
+    await new Promise(r => setTimeout(r, 1500));
+    res = await fetchOne();
+  }
   if (!res.ok) throw new Error('arXiv HTTP ' + res.status);
   const xml = await res.text();
   const papers: Paper[] = [];

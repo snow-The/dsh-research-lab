@@ -89,6 +89,8 @@ export function rewriteText(text: string): RewriteResult {
     const count = (before.match(new RegExp(rule.pattern.source, rule.pattern.flags)) || []).length;
     if (count > 0) applied.push({ name: rule.name, reason: rule.reason, count });
   }
+  // post-pass: capitalize sentence starts (rules may lowercase after replacement)
+  cur = cur.replace(/(^|[.!?]\s+)([a-z])/g, (m, pre: string, ch: string) => pre + ch.toUpperCase());
   return { before: text, after: cur, applied };
 }
 

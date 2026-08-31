@@ -116,7 +116,7 @@ export function mineKeywords(project: string, topN = 40): KeywordHit[] {
 // ---- FTS5 search ----
 export function search(project: string, query: string, k = 10): RelatedDoc[] {
   const db = openDb(project);
-  const q = ftsText(query).split(' ').filter(Boolean).slice(0, 12).join(' OR ');
+  const q = ftsText(query).split(' ').filter(Boolean).slice(0, 12).map(t => '"' + t + '"').join(' OR ');
   if (!q) return [];
   const rows = db.prepare(`
     SELECT d.id, d.title, d.body, d.source, d.added, bm25(docs_fts) AS rank

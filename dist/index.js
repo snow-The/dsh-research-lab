@@ -8,7 +8,12 @@ var esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&
 async function arxivQuery(params) {
   const qs = new URLSearchParams(params).toString();
   const url = "https://export.arxiv.org/api/query?" + qs;
-  const res = await fetch(url, { headers: { "User-Agent": "dsh-research-lab/0.1" }, signal: AbortSignal.timeout(3e4) });
+  const fetchOne = () => fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (dsh-research-lab/0.1)" }, signal: AbortSignal.timeout(3e4) });
+  let res = await fetchOne();
+  if (res.status === 429) {
+    await new Promise((r) => setTimeout(r, 1500));
+    res = await fetchOne();
+  }
   if (!res.ok) throw new Error("arXiv HTTP " + res.status);
   const xml = await res.text();
   const papers = [];
@@ -453,7 +458,7 @@ function mineKeywords(project, topN = 40) {
 }
 function search(project, query, k = 10) {
   const db = openDb(project);
-  const q = ftsText(query).split(" ").filter(Boolean).slice(0, 12).join(" OR ");
+  const q = ftsText(query).split(" ").filter(Boolean).slice(0, 12).map((t) => '"' + t + '"').join(" OR ");
   if (!q) return [];
   const rows = db.prepare(`
     SELECT d.id, d.title, d.body, d.source, d.added, bm25(docs_fts) AS rank
@@ -624,6 +629,7 @@ function rewriteText(text) {
     const count = (before.match(new RegExp(rule.pattern.source, rule.pattern.flags)) || []).length;
     if (count > 0) applied.push({ name: rule.name, reason: rule.reason, count });
   }
+  cur = cur.replace(/(^|[.!?]\s+)([a-z])/g, (m, pre, ch) => pre + ch.toUpperCase());
   return { before: text, after: cur, applied };
 }
 function rewriteReport(text) {

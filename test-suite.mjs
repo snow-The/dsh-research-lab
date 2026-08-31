@@ -21,11 +21,13 @@ ok('hybrid zh query finds collapse doc', h2.some(t => t.includes('塌缩')), h2.
 const kw = rel.topKeywords(PROJ, 5);
 ok('auto lexicon non-empty', kw.length > 0, kw.map(k => k.term).join(','));
 const ex = rel.expandSearch(PROJ, 'compact student', 2, 5);
+const ex4b = rel.expandSearch(PROJ, 'model 4b', 2, 5);
+ok('expand with numeric token (4b) does not crash', ex4b.rounds.length > 0, String(ex4b.rounds.length));
 ok('expand mines new terms', ex.rounds.length > 0 && ex.rounds.some(r => r.newTerms.length > 0), JSON.stringify(ex.rounds.map(r => r.newTerms)));
 
 console.log('== 2. rlab_rewrite: rule engine ==');
 const rw = rel.rewriteText('In order to improve results, we used a large number of samples. The model was evaluated by the committee.');
-ok('filler + weak verb + quantifier', rw.after.includes('to improve') && rw.after.includes('employ') && rw.after.includes('many samples'), rw.after);
+ok('filler + weak verb + quantifier', rw.after.includes('To improve') && rw.after.includes('employ') && rw.after.includes('many samples'), rw.after);
 ok('passive to active', rw.after.includes('The committee evaluated'), rw.after);
 ok('rule report counts', rw.applied.length >= 4, JSON.stringify(rw.applied.map(a => a.name)));
 ok('no-change passthrough', rel.rewriteText('Clean active sentence stays here.').applied.length === 0);
