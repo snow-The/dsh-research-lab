@@ -127,6 +127,64 @@ export function search(project: string, query: string, k = 10): RelatedDoc[] {
   return rows;
 }
 
+
+// ---- BM25 + RRF hybrid (ported from w8-core/src/retrieval.ts, Okapi 1994 + RRF) ----
+function bm25Scores(query: string, docs: { id: number; text: string }[], k1 = 1.5, b = 0.75): Map<number, number> {
+  const scores = new Map<number, number>();
+  const qt = new Set(tokenize(query));
+  if (!qt.size || !docs.length) return scores;
+  const N = docs.length;
+  const avgdl = docs.reduce((s, d) => s + d.text.length, 0) / N;
+  const df = new Map<string, number>();
+  const docToks = docs.map(d => {
+    const toks = tokenize(d.text);
+    for (const t of new Set(toks)) df.set(t, (df.get(t) || 0) + 1);
+    return toks;
+  });
+  for (let i = 0; i < docs.length; i++) {
+    const d = docs[i];
+    let s = 0;
+    const tf = new Map<string, number>();
+    for (const t of docToks[i]) tf.set(t, (tf.get(t) || 0) + 1);
+    for (const t of qt) {
+      const f = tf.get(t) || 0;
+      if (!f) continue;
+      const idf = Math.log(1 + (N - (df.get(t) || 0) + 0.5) / ((df.get(t) || 0) + 0.5));
+      const denom = f + k1 * (1 - b + b * (d.text.length / avgdl));
+      s += idf * ((f * (k1 + 1)) / denom);
+    }
+    if (s > 0) scores.set(d.id, s);
+  }
+  return scores;
+}
+
+function rrfFuse(lists: (number | string)[][], k = 60): Map<string | number, number> {
+  const fused = new Map<string | number, number>();
+  for (const list of lists) {
+    for (let i = 0; i < list.length; i++) {
+      const id = list[i];
+      fused.set(id, (fused.get(id) || 0) + 1 / (k + i + 1));
+    }
+  }
+  return fused;
+}
+
+export function hybridSearch(project: string, query: string, k = 10): RelatedDoc[] {
+  const db = openDb(project);
+  const rows = db.prepare('SELECT id, title, body, source, added FROM docs').all() as unknown as RelatedDoc[];
+  if (!rows.length) return [];
+  // path 1: FTS5
+  const fts = search(project, query, k * 2).map(d => d.id);
+  // path 2: BM25 over raw text (finer CJK granularity than FTS5 unicode61)
+  const bm = bm25Scores(query, rows.map(d => ({ id: d.id, text: d.title + ' ' + d.body })));
+  const bmIds = [...bm.entries()].sort((a, b) => b[1] - a[1]).slice(0, k * 2).map(([id]) => id);
+  // fuse with RRF
+  const fused = rrfFuse([fts, bmIds], 60);
+  const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([id]) => Number(id));
+  const byId = new Map(rows.map(d => [d.id, d]));
+  return ranked.map(id => byId.get(id)).filter((d): d is RelatedDoc => !!d);
+}
+
 export function addDoc(project: string, title: string, body: string, source: string): number {
   const db = openDb(project);
   const r = db.prepare('INSERT INTO docs(title, body, source) VALUES (?,?,?)')
@@ -153,7 +211,7 @@ export function expandSearch(project: string, seed: string, rounds = 2, k = 8): 
   const report: { round: number; newTerms: string[]; hits: RelatedDoc[] }[] = [];
   let final: RelatedDoc[] = [];
   for (let r = 1; r <= rounds; r++) {
-    const hits = search(project, query, k);
+    const hits = hybridSearch(project, query, k);
     final = hits;
     // mine new terms from this round's top hits (title+body, weighted)
     const toks = new Map<string, number>();

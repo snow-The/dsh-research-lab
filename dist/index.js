@@ -463,6 +463,56 @@ function search(project, query, k = 10) {
   `).all(q, k);
   return rows;
 }
+function bm25Scores(query, docs, k1 = 1.5, b = 0.75) {
+  const scores = /* @__PURE__ */ new Map();
+  const qt = new Set(tokenize(query));
+  if (!qt.size || !docs.length) return scores;
+  const N = docs.length;
+  const avgdl = docs.reduce((s, d) => s + d.text.length, 0) / N;
+  const df = /* @__PURE__ */ new Map();
+  const docToks = docs.map((d) => {
+    const toks = tokenize(d.text);
+    for (const t of new Set(toks)) df.set(t, (df.get(t) || 0) + 1);
+    return toks;
+  });
+  for (let i = 0; i < docs.length; i++) {
+    const d = docs[i];
+    let s = 0;
+    const tf = /* @__PURE__ */ new Map();
+    for (const t of docToks[i]) tf.set(t, (tf.get(t) || 0) + 1);
+    for (const t of qt) {
+      const f = tf.get(t) || 0;
+      if (!f) continue;
+      const idf = Math.log(1 + (N - (df.get(t) || 0) + 0.5) / ((df.get(t) || 0) + 0.5));
+      const denom = f + k1 * (1 - b + b * (d.text.length / avgdl));
+      s += idf * (f * (k1 + 1) / denom);
+    }
+    if (s > 0) scores.set(d.id, s);
+  }
+  return scores;
+}
+function rrfFuse(lists, k = 60) {
+  const fused = /* @__PURE__ */ new Map();
+  for (const list of lists) {
+    for (let i = 0; i < list.length; i++) {
+      const id = list[i];
+      fused.set(id, (fused.get(id) || 0) + 1 / (k + i + 1));
+    }
+  }
+  return fused;
+}
+function hybridSearch(project, query, k = 10) {
+  const db = openDb(project);
+  const rows = db.prepare("SELECT id, title, body, source, added FROM docs").all();
+  if (!rows.length) return [];
+  const fts = search(project, query, k * 2).map((d) => d.id);
+  const bm = bm25Scores(query, rows.map((d) => ({ id: d.id, text: d.title + " " + d.body })));
+  const bmIds = [...bm.entries()].sort((a, b) => b[1] - a[1]).slice(0, k * 2).map(([id]) => id);
+  const fused = rrfFuse([fts, bmIds], 60);
+  const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([id]) => Number(id));
+  const byId = new Map(rows.map((d) => [d.id, d]));
+  return ranked.map((id) => byId.get(id)).filter((d) => !!d);
+}
 function addDoc(project, title, body, source) {
   const db = openDb(project);
   const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(title, ftsText(title + " " + body), source);
@@ -480,7 +530,7 @@ function expandSearch(project, seed, rounds = 2, k = 8) {
   const report = [];
   let final = [];
   for (let r = 1; r <= rounds; r++) {
-    const hits = search(project, query, k);
+    const hits = hybridSearch(project, query, k);
     final = hits;
     const toks = /* @__PURE__ */ new Map();
     for (const h of hits) {
