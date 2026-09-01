@@ -19,10 +19,13 @@ import {
   appendBench, benchReport, listWiki, readBench, rebuildWikiIndex, rlabDir, writeWikiPage,
   type BenchRow, type WikiKind,
 } from './store.js';
-import { addDoc, expandSearch, hybridSearch, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
+import { addDoc, expandSearch, hybridSearch, ingestDocDir, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
 import { rewriteReport } from './rewrite.js';
 import { addClaims, betaConfidence, citeClaim, claimsReport, extractClaims, loadClaims } from './extract.js';
 import { suggestExternal, suggestZh } from './suggest.js';
+import { cloneAndStudy } from './ref.js';
+import * as os from 'node:os';
+import { OCR_MODELS, fetchOcrMarkdown, ocrToken, runOcr, type OcrModel } from './ocr.js';
 
 const textOut = { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] };
 const today = () => new Date().toISOString().slice(0, 10);
@@ -30,7 +33,52 @@ const today = () => new Date().toISOString().slice(0, 10);
 export const name = 'dsh-research-lab';
 export const inject = ['tools'];
 
+import { validateWiki } from './validate.js';
+import { genLatex, lintLatex, LATEX_KINDS } from './latex.js';
+
 export async function apply(ctx: any) {
+  // ---------------- rlab_validate ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_validate',
+    description: 'Validate a research-wiki against the ΩmegaWiki contract: frontmatter schema (id/kind/title/updated), kind legality, id-filename consistency, [[wikilink]] bidirectional graph, dangling and isolated pages. Run after rlab_wiki batches or before publishing.'
+    .replace(/ΩmegaWiki contract/, 'ΩmegaWiki contract'),
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+    },
+    output: textOut,
+    timeoutMs: 15000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      if (!project) throw new Error('project required');
+      return validateWiki(project);
+    },
+  }));
+
+  // ---------------- rlab_latex ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_latex',
+    description: 'Scaffold a Chinese/English research LaTeX document (paper/thesis/NSFC skeleton with ctex + xeCJK preamble) or lint an existing .tex for common issues (unpaired begin/end, odd dollar count, quote style). Zero-dependency pure template registry (hono-style).'
+    .replace(/hono-style/, 'hono-style'),
+    parameters: {
+      kind: { type: 'string', required: true, description: 'paper-zh | thesis-zh | nsfc-zh | paper-en' },
+      title: { type: 'string', description: 'document title' },
+      author: { type: 'string', description: 'author name' },
+      affiliation: { type: 'string', description: 'affiliation (as \\thanks)' },
+      keywords: { type: 'string', description: 'comma-separated keywords' },
+      abstract: { type: 'string', description: 'abstract text' },
+      text: { type: 'string', description: 'existing .tex content to lint (when set, lints instead of generating)' },
+    },
+    output: textOut,
+    timeoutMs: 15000,
+    async execute(args: any) {
+      const kind = String(args?.kind ?? '').trim() as any;
+      const text = String(args?.text ?? '').trim();
+      if (text) return lintLatex(text);
+      if (!LATEX_KINDS.includes(kind)) throw new Error('kind must be one of: ' + LATEX_KINDS.join(', '));
+      return genLatex(kind, { title: args?.title, author: args?.author, affiliation: args?.affiliation, keywords: args?.keywords, abstract: args?.abstract });
+    },
+  }));
+
   // ---------------- rlab_wiki ----------------
   ctx.tools.register(defineTool({
     name: 'rlab_wiki',
@@ -41,7 +89,7 @@ export async function apply(ctx: any) {
       id: { type: 'string', required: true, description: 'short kebab id, e.g. m10-contrastive or arxiv-2602.04770' },
       title: { type: 'string', required: true, description: 'page title' },
       content: { type: 'string', required: true, description: 'markdown body' },
-      tags: { type: 'array', required: false, description: 'optional tags' },
+      tags: { type: 'array', description: 'optional tags' },
     },
     output: textOut,
     timeoutMs: 15000,
@@ -56,7 +104,12 @@ export async function apply(ctx: any) {
         content: String(args?.content ?? ''), tags: args?.tags as string[] | undefined,
       });
       const idx = rebuildWikiIndex(project);
-      return 'Wrote ' + p + '\nIndex: ' + idx;
+      let ix = '';
+      try {
+        addDoc(project, 'wiki/' + kind + '/' + id, String(args?.title ?? id) + '\n\n' + String(args?.content ?? ''), 'wiki');
+        ix = '\nIndexed into related.db — now searchable via rlab_related.';
+      } catch { ix = '\n(related.db index skipped — db unavailable)'; }
+      return 'Wrote ' + p + '\nIndex: ' + idx + ix;
     },
   }));
 
@@ -70,11 +123,11 @@ export async function apply(ctx: any) {
       task: { type: 'string', required: true, description: 'task name, e.g. STS12 or MTEB-Multilingual-v2' },
       score: { type: 'number', required: true, description: 'the metric value' },
       metric: { type: 'string', required: true, description: 'cos_sim.spearman | ndcg_at_10 | accuracy | ...' },
-      split: { type: 'string', required: false, description: 'test | dev | validation (default test)' },
-      hf_subset: { type: 'string', required: false, description: 'huggingface subset when task has one' },
-      prompt_type: { type: 'string', required: false, description: 'e.g. query|passage, or none' },
-      seed: { type: 'number', required: false, description: 'seed if stochastic' },
-      note: { type: 'string', required: false, description: 'free note, e.g. "batch 128, fp32, compile off"' },
+      split: { type: 'string', description: 'test | dev | validation (default test)' },
+      hf_subset: { type: 'string', description: 'huggingface subset when task has one' },
+      prompt_type: { type: 'string', description: 'e.g. query|passage, or none' },
+      seed: { type: 'number', description: 'seed if stochastic' },
+      note: { type: 'string', description: 'free note, e.g. "batch 128, fp32, compile off"' },
     },
     output: textOut,
     timeoutMs: 10000,
@@ -106,7 +159,7 @@ export async function apply(ctx: any) {
       project: { type: 'string', required: true, description: 'absolute path to the research project root' },
       id: { type: 'string', required: true, description: 'short kebab id, e.g. v4-permcons' },
       hypothesis: { type: 'string', required: true, description: 'what you believed and why (with references)' },
-      prediction: { type: 'string', required: false, description: 'falsifiable prediction + decision rule, e.g. "STS12 >= 0.5 → mechanism works"' },
+      prediction: { type: 'string', description: 'falsifiable prediction + decision rule, e.g. "STS12 >= 0.5 → mechanism works"' },
       evidence: { type: 'string', required: true, description: 'what actually happened: numbers, logs, artifacts' },
       verdict: { type: 'string', required: true, description: 'confirmed | refuted | inconclusive' },
       conclusion: { type: 'string', required: true, description: 'what this changes for the project' },
@@ -138,8 +191,8 @@ export async function apply(ctx: any) {
     description: 'Pull an arXiv paper by id (or abs URL) and produce a structured adversarial review checklist (ChatPaper summary + ASI-Bench rigor): contribution, method, evidence strength, baseline fairness, flaws, reproducibility. The checklist is the same one you should apply to your OWN paper before submission.',
     parameters: {
       arxivId: { type: 'string', required: true, description: 'e.g. 2602.04770 or full https://arxiv.org/abs/2602.04770 URL' },
-      focus: { type: 'string', required: false, description: 'what to look for, e.g. "is the eval protocol sound?"' },
-      outputFile: { type: 'string', required: false, description: 'optional absolute path to write the review markdown' },
+      focus: { type: 'string', description: 'what to look for, e.g. "is the eval protocol sound?"' },
+      outputFile: { type: 'string', description: 'optional absolute path to write the review markdown' },
     },
     output: textOut,
     timeoutMs: 60000,
@@ -200,8 +253,9 @@ export async function apply(ctx: any) {
     parameters: {
       project: { type: 'string', required: true, description: 'absolute path to the research project root' },
       queries: { type: 'array', required: true, description: 'search terms, e.g. ["embedding distillation", "efficient retrieval"]' },
-      maxPerQuery: { type: 'number', required: false, description: 'papers per query (default 10, max 30)' },
-      withSummary: { type: 'boolean', required: false, description: 'include 500-char abstracts (default false)' },
+      maxPerQuery: { type: 'number', description: 'papers per query (default 10, max 30)' },
+      withSummary: { type: 'boolean', description: 'include 500-char abstracts (default false)' },
+      wiki: { type: 'boolean', description: 'also write every paper as a literature wiki page and index into related.db (default false)' },
     },
     output: textOut,
     timeoutMs: 120000,
@@ -233,7 +287,23 @@ export async function apply(ctx: any) {
       const lines = ['# arXiv digest — ' + date, '', 'queries: ' + queries.join(' | '), 'papers: ' + all.length, ''];
       lines.push(formatPapers(all, withSummary));
       fs.writeFileSync(file, lines.join('\n') + '\n', 'utf8');
-      return 'Digest written to ' + file + ' (' + all.length + ' papers)\n\n' + formatPapers(all.slice(0, 10), withSummary);
+      let wikiCount = 0;
+      if (args?.wiki === true) {
+        const wseen = new Set<string>();
+        for (const p of all) {
+          if (!p.id || p.id === 'ERR' || wseen.has(p.id)) continue;
+          wseen.add(p.id);
+          try {
+            const slug = p.id.replace(/[^\w-]+/g, '').slice(0, 60);
+            const content = '## Title\n' + p.title + '\n\n## Authors\n' + (p.authors || []).join(', ').slice(0, 300) +
+              '\n\n## Abstract\n' + (p.summary || '').slice(0, 1200) + '\n\n## Links\n- ' + (p.absUrl || '') + '\n- ' + (p.pdfUrl || '');
+            writeWikiPage(project, { kind: 'literature', id: slug, title: String(p.title).slice(0, 120), updated: today(), content, tags: ['arxiv', ...(p.categories || []).slice(0, 3)] });
+            addDoc(project, 'wiki/literature/' + slug, String(p.title) + '\n\n' + (p.summary || ''), 'arxiv:' + p.id);
+            wikiCount++;
+          } catch { /* skip single paper */ }
+        }
+      }
+      return 'Digest written to ' + file + ' (' + all.length + ' papers' + (wikiCount ? ', ' + wikiCount + ' wiki pages written' : '') + ')\n\n' + formatPapers(all.slice(0, 10), withSummary);
     },
   }));
 
@@ -322,10 +392,10 @@ export async function apply(ctx: any) {
     parameters: {
       project: { type: 'string', required: true, description: 'absolute path to the research project root' },
       action: { type: 'string', required: true, description: 'extract | cite | list' },
-      text: { type: 'string', required: false, description: 'paper text to extract from (action=extract)' },
-      docId: { type: 'number', required: false, description: 'indexed doc id to extract from (action=extract)' },
-      claimId: { type: 'number', required: false, description: 'claim id to cite (action=cite)' },
-      type: { type: 'string', required: false, description: 'filter list by claim type' },
+      text: { type: 'string', description: 'paper text to extract from (action=extract)' },
+      docId: { type: 'number', description: 'indexed doc id to extract from (action=extract)' },
+      claimId: { type: 'number', description: 'claim id to cite (action=cite)' },
+      type: { type: 'string', description: 'filter list by claim type' },
     },
     output: textOut,
     timeoutMs: 20000,
@@ -365,21 +435,44 @@ export async function apply(ctx: any) {
     },
   }));
 
+  // ---------------- rlab_ref: shallow-clone + auto study note ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_ref',
+    description: 'Shallow-clone a public GitHub repo and auto-generate a study note (REF.md): README/CLAUDE.md excerpts, 2-level tree, file count, absorption-decision table to fill in. The zero-config research habit: new reference project -> study note in seconds. Also indexable via rlab_related ingest.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root (refs go to <project>/.rlab/refs/)' },
+      url: { type: 'string', required: true, description: 'github.com URL, e.g. https://github.com/skyllwt/AutoSci' },
+    },
+    output: textOut,
+    timeoutMs: 150000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      const url = String(args?.url ?? '').trim();
+      if (!project || !url) throw new Error('project and url required');
+      const res = cloneAndStudy(url, path.join(rlabDir(project), 'refs'));
+      return 'Cloned ' + res.repo + ' -> ' + res.dir + ' (' + res.files + ' files)' + String.fromCharCode(10)
+        + 'Study note: ' + res.noteFile + String.fromCharCode(10) + String.fromCharCode(10)
+        + '## README excerpt' + String.fromCharCode(10) + res.readme.slice(0, 400) + String.fromCharCode(10) + String.fromCharCode(10)
+        + '## Structure' + String.fromCharCode(10) + res.tree.slice(0, 15).join(String.fromCharCode(10));
+    },
+  }));
+
   // ---------------- rlab_related: self-building keyword retrieval ----------------
   ctx.tools.register(defineTool({
     name: 'rlab_related',
     description: 'Self-building keyword retrieval over a project document store (NLP + SQLite FTS5, zero deps). NO preset lexicon: terms are mined from the corpus via TF-IDF (English words + Chinese n-grams) and the lexicon grows with every added doc. Actions: add (index a doc), search (FTS5), expand (iterative relevance feedback: search → mine new terms from top hits → merge into query → repeat, rounds=1..4), keywords (show the auto-built lexicon), list (all docs). DB at <project>/.rlab/related.db.',
     parameters: {
       project: { type: 'string', required: true, description: 'absolute path to the research project root' },
-      action: { type: 'string', required: true, description: 'add | search | expand | keywords | list' },
-      title: { type: 'string', required: false, description: 'doc title (add)' },
-      body: { type: 'string', required: false, description: 'doc body/text (add)' },
-      source: { type: 'string', required: false, description: 'origin, e.g. arxiv:2602.04770 or file path (add)' },
-      query: { type: 'string', required: false, description: 'search query (search/expand), plain words, zh or en' },
-      k: { type: 'number', required: false, description: 'results per round (default 8, max 20)' },
-      rounds: { type: 'number', required: false, description: 'expansion rounds (default 2, max 4)' },
-      external: { type: 'boolean', required: false, description: 'also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)' },
-      topN: { type: 'number', required: false, description: 'lexicon size for keywords (default 30)' },
+      action: { type: 'string', required: true, description: 'add | search | expand | keywords | list | ingest' },
+      title: { type: 'string', description: 'doc title (add)' },
+      body: { type: 'string', description: 'doc body/text (add)' },
+      source: { type: 'string', description: 'origin, e.g. arxiv:2602.04770 or file path (add)' },
+      query: { type: 'string', description: 'search query (search/expand), plain words, zh or en' },
+      k: { type: 'number', description: 'results per round (default 8, max 20)' },
+      rounds: { type: 'number', description: 'expansion rounds (default 2, max 4)' },
+      external: { type: 'boolean', description: 'also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)' },
+      topN: { type: 'number', description: 'lexicon size for keywords (default 30)' },
+      dir: { type: 'string', description: 'directory to bulk-ingest (ingest). Default: auto-detect .dsh-lib-analyzer/pages, .rlab/wiki, batch/out' },
     },
     output: textOut,
     timeoutMs: 60000,
@@ -429,6 +522,19 @@ export async function apply(ctx: any) {
           lines.push('', '## Auto-built lexicon (top ' + res.lexicon.length + ')', res.lexicon.slice(0, 15).map(x => x.term + '  score=' + x.score.toFixed(2) + ' freq=' + x.freq + ' docs=' + x.docs).join('\n'));
           return lines.join('\n');
         }
+        case 'ingest': {
+          const dir = String(args?.dir ?? '').trim();
+          const cands = dir ? [dir] : [path.join(project, '.dsh-lib-analyzer', 'pages'), path.join(project, '.rlab', 'wiki'), path.join(project, 'batch', 'out')];
+          const parts: string[] = [];
+          let total = 0, skipped = 0;
+          for (const cdir of cands) {
+            if (!fs.existsSync(cdir)) { if (dir) throw new Error('dir not found: ' + cdir); continue; }
+            const res = ingestDocDir(project, cdir);
+            total += res.added; skipped += res.skipped;
+            parts.push(path.basename(cdir) + ':+' + res.added);
+          }
+          return 'Ingested ' + total + ' files (skipped ' + skipped + ') — ' + (parts.join(' | ') || '(no ingest dirs found — pass dir=)') + '\nLexicon updated automatically. Try search or expand now.';
+        }
         case 'keywords': {
           const kw = topKeywords(project, topN);
           if (!kw.length) return 'Lexicon empty — add docs first (rlab_related action=add).';
@@ -441,8 +547,99 @@ export async function apply(ctx: any) {
           return 'Docs (' + rows.length + '):\n' + rows.map(x => '• #' + x.id + ' ' + x.title + (x.source ? '  (' + x.source + ')' : '') + '  ' + x.added).join('\n');
         }
         default:
-          throw new Error('action must be add|search|expand|keywords|list');
+          throw new Error('action must be add|search|expand|keywords|list|ingest');
       }
+    },
+  }));
+
+  // ---------------- rlab_ocr: PaddleOCR document ingestion ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_ocr',
+    description: 'Submit a document (local file path or http(s) URL) to PaddleOCR cloud and auto-ingest it into the research lab: downloads markdown + images into <project>/ocr/<name>/, indexes into related.db, optionally writes a literature wiki page. Models: PaddleOCR-VL-1.6 (all-round: complex layouts, flow charts) | PP-OCRv6 (light: fixed charts). Quality-max params enabled. Token from env PADDLE_OCR_TOKEN or ~/.dsh/paddle-ocr.token (never hardcoded). Free quota 20000 pages/day per model.',
+    parameters: {
+      file: { type: 'string', required: true, description: 'local file path or http(s) URL of the document (PDF/PNG/JPG...) to OCR' },
+      model: { type: 'string', description: 'PaddleOCR-VL-1.6 (default, all-round) | PP-OCRv6 (light)' },
+      project: { type: 'string', description: 'research project root — used for outDir/index/wiki (optional)' },
+      outDir: { type: 'string', description: 'output dir for markdown+images (default <project>/ocr/<name>/ or ~/dsh-ocr/<name>/)' },
+      index: { type: 'boolean', description: 'index the markdown into related.db (default true)' },
+      wiki: { type: 'boolean', description: 'also write a literature wiki page (default false)' },
+      maxWaitMs: { type: 'number', description: 'job poll timeout in ms (default 300000)' },
+    },
+    output: textOut,
+    timeoutMs: 600000,
+    async execute(args: any) {
+      const file = String(args?.file ?? '').trim();
+      if (!file) throw new Error('file required (local path or http(s) URL)');
+      const model = (String(args?.model ?? 'PaddleOCR-VL-1.6').trim() as OcrModel);
+      if (!OCR_MODELS.includes(model)) throw new Error('model must be ' + OCR_MODELS.join(' | '));
+      const project = String(args?.project ?? '').trim();
+      const t0 = Date.now();
+      const job = await runOcr(file, model, { maxWaitMs: Number(args?.maxWaitMs) || 300000 });
+      const base = path.basename(file).replace(/\.[^.]+$/, '').replace(/[^\w\u4e00-\u9fff-]+/g, '-').slice(0, 60) || 'doc';
+      const outDir = String(args?.outDir ?? '').trim() || (project ? path.join(project, 'ocr', base) : path.join(os.homedir(), 'dsh-ocr', base));
+      const md = await fetchOcrMarkdown(job.jsonlUrl, outDir);
+      const lines = ['✅ OCR done: ' + file,
+        'model: ' + model + '  pages: ' + md.pages + '  chars: ' + md.chars + '  images: ' + md.images + '  time: ' + Math.round((Date.now() - t0) / 1000) + 's',
+        'md: ' + md.mdPath];
+      if (project && args?.index !== false) {
+        const id = addDoc(project, 'ocr/' + base + '/doc.md', md.text, 'paddleocr:' + model);
+        lines.push('indexed into related.db: doc #' + id);
+      }
+      if (project && args?.wiki === true) {
+        const p = writeWikiPage(project, { kind: 'literature', id: base, title: base + ' (OCR)', updated: today(), content: md.text.slice(0, 4000) + '\n\n---\nSource: ' + file + ' (PaddleOCR ' + model + ')', tags: ['ocr'] });
+        lines.push('wiki page: ' + p);
+      }
+      lines.push('quota note: 20000 free pages/day per model');
+      return lines.join('\n');
+    },
+  }));
+
+  // ---------------- rlab_absorb: lib-analyzer reports -> wiki pages ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_absorb',
+    description: 'Auto-absorb dsh-lib-analyzer reports into the research wiki + related.db: scans batch/out and .dsh-lib-analyzer/pages for .md reports and writes each as a wiki page (kind=experiment by default) and indexes it. The zero-friction loop: libreport sinks a knowledge page -> run this -> it becomes wiki literature/experiment pages searchable via rlab_related.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      dir: { type: 'string', description: 'directory to scan (default: auto-detect batch/out + .dsh-lib-analyzer/pages)' },
+      kind: { type: 'string', description: 'wiki kind: experiment (default) | literature | decision' },
+      max: { type: 'number', description: 'max reports to absorb (default 50)' },
+    },
+    output: textOut,
+    timeoutMs: 60000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      if (!project) throw new Error('project required');
+      const kind = String(args?.kind ?? 'experiment').trim();
+      if (!['experiment', 'literature', 'decision'].includes(kind)) throw new Error('kind must be experiment|literature|decision');
+      const max = Number(args?.max) || 50;
+      const dirs = String(args?.dir ?? '').trim()
+        ? [String(args?.dir).trim()]
+        : [path.join(project, 'batch', 'out'), path.join(project, '.dsh-lib-analyzer', 'pages')];
+      let written = 0, indexed = 0, skipped = 0;
+      const files: string[] = [];
+      for (const d of dirs) {
+        if (!fs.existsSync(d)) continue;
+        const walk = (p: string) => {
+          for (const f of fs.readdirSync(p, { withFileTypes: true })) {
+            if (f.name.startsWith('.')) continue;
+            const full = path.join(p, f.name);
+            if (f.isDirectory()) walk(full);
+            else if (f.name.endsWith('.md') && files.length < max) files.push(full);
+          }
+        };
+        walk(d);
+      }
+      for (const f of files) {
+        try {
+          const text = fs.readFileSync(f, 'utf8').slice(0, 20000);
+          const rel = path.relative(project, f).replace(/\\/g, '/');
+          const slug = path.basename(f, '.md').replace(/[^\w\u4e00-\u9fff-]+/g, '-').slice(0, 60) || 'report';
+          writeWikiPage(project, { kind: kind as any, id: slug, title: slug + ' (absorbed)', updated: today(), content: text.slice(0, 5000) + '\n\n---\nSource: ' + rel, tags: ['absorb', path.basename(path.dirname(f))] });
+          addDoc(project, rel, text, 'absorb');
+          written++; indexed++;
+        } catch { skipped++; }
+      }
+      return 'Absorbed ' + written + ' reports (' + files.length + ' found, ' + skipped + ' skipped) from: ' + (dirs.filter(d => fs.existsSync(d)).join(', ') || '(no dirs)') + '\nwiki pages: ' + written + ' | related.db docs: ' + indexed;
     },
   }));
 

@@ -20,6 +20,10 @@ export declare function mineKeywords(project: string, topN?: number): KeywordHit
 export declare function search(project: string, query: string, k?: number): RelatedDoc[];
 export declare function hybridSearch(project: string, query: string, k?: number): RelatedDoc[];
 export declare function addDoc(project: string, title: string, body: string, source: string): number;
+export declare function ingestDocDir(project: string, dir: string, maxFiles?: number): {
+    added: number;
+    skipped: number;
+};
 export declare function topKeywords(project: string, topN?: number): KeywordHit[];
 export declare function expandSearch(project: string, seed: string, rounds?: number, k?: number): {
     rounds: {

@@ -193,6 +193,32 @@ export function addDoc(project: string, title: string, body: string, source: str
   return Number(r.lastInsertRowid);
 }
 
+// Bulk-ingest .md files from a directory (e.g. .dsh-lib-analyzer/pages, batch/out, w8/ref) —
+// interoperability with dsh-lib-analyzer knowledge pages and absorption reports.
+export function ingestDocDir(project: string, dir: string, maxFiles = 200): { added: number; skipped: number } {
+  const root = path.resolve(dir);
+  if (!fs.existsSync(root)) return { added: 0, skipped: 0 };
+  let added = 0, skipped = 0;
+  const walk = (d: string, depth: number) => {
+    if (depth > 4 || added >= maxFiles) return;
+    for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+      if (f.name.startsWith('.')) continue;
+      const full = path.join(d, f.name);
+      if (f.isDirectory()) { walk(full, depth + 1); continue; }
+      if (!f.name.endsWith('.md') && !f.name.endsWith('.mdx')) { skipped++; continue; }
+      if (added >= maxFiles) return;
+      try {
+        const text = fs.readFileSync(full, 'utf8').slice(0, 20000);
+        const rel = path.relative(root, full);
+        addDoc(project, rel, text, 'ingest:' + path.basename(root));
+        added++;
+      } catch { skipped++; }
+    }
+  };
+  walk(root, 0);
+  return { added, skipped };
+}
+
 export function topKeywords(project: string, topN = 30): KeywordHit[] {
   const db = openDb(project);
   return db.prepare('SELECT term, score, freq, docs FROM keywords ORDER BY score DESC LIMIT ?')

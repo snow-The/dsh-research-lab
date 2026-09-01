@@ -41,6 +41,25 @@ export interface WikiPage {
 
 const WIKI_DIR = 'wiki';
 
+// OmegaWiki frontmatter: --- block of key: value lines (shared contract with rlab_validate)
+export function parseFrontmatter(text: string): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  const m = text.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!m) return out;
+  for (const line of m[1].split('\n')) {
+    const mm = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!mm) continue;
+    const key = mm[1];
+    const val = mm[2].trim();
+    if (val.startsWith('[') && val.endsWith(']')) {
+      out[key] = val.slice(1, -1).split(',').map(s => s.trim()).filter(Boolean);
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
 export function wikiPath(project: string, kind: WikiKind, id: string): string {
   const safe = id.replace(/[^A-Za-z0-9_.-]/g, '_');
   return path.join(rlabDir(project), WIKI_DIR, kind, safe + '.md');
@@ -48,16 +67,29 @@ export function wikiPath(project: string, kind: WikiKind, id: string): string {
 
 export function writeWikiPage(project: string, page: WikiPage): string {
   const p = wikiPath(project, page.kind, page.id);
-  const body = [
-    '# ' + page.title,
+  const fm = [
+    '---',
+    'id: ' + page.id,
+    'kind: ' + page.kind,
+    'title: ' + page.title.replace(/\n/g, ' '),
+    'updated: ' + page.updated,
+    (page.tags?.length ? 'tags: [' + page.tags.join(', ') + ']' : 'tags: []'),
+    '---',
     '',
-    'kind: ' + page.kind + '  |  id: ' + page.id + '  |  updated: ' + page.updated + (page.tags?.length ? '  |  tags: ' + page.tags.join(', ') : ''),
+  ].join('\n');
+  const body = [
+    fm,
+    '# ' + page.title,
     '',
     page.content.trim(),
     '',
   ].join('\n');
   ensureDir(path.dirname(p));
   fs.writeFileSync(p, body, 'utf8');
+  // append-only operation log (AutoSci hard rule: wiki/log.md never rewritten in place)
+  const log = path.join(rlabDir(project), 'wiki', 'log.md');
+  const stamp = new Date().toISOString();
+  fs.appendFileSync(log, '- ' + stamp + '  ' + page.kind + ':' + page.id + '  ' + page.title.replace(/[\r\n]+/g, ' ') + '\n', 'utf8');
   return p;
 }
 
@@ -72,9 +104,10 @@ export function listWiki(project: string): WikiPage[] {
       if (!f.endsWith('.md')) continue;
       const full = path.join(dir, f);
       const text = fs.readFileSync(full, 'utf8');
-      const title = (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, '');
-      const updated = (text.match(/updated: ([^|]+)/) || [])[1]?.trim() || '';
-      const tags = (text.match(/tags: (.+)/) || [])[1]?.split(',').map(s => s.trim()).filter(Boolean) || [];
+      const fm = parseFrontmatter(text);
+      const title = String(fm.title || (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, ''));
+      const updated = String(fm.updated || '');
+      const tags: string[] = Array.isArray(fm.tags) ? fm.tags : (fm.tags ? [String(fm.tags)] : []);
       pages.push({ kind, id: f.replace(/\.md$/, ''), title, updated, tags, content: '' });
     }
   }

@@ -1,7 +1,7 @@
 // src/index.ts
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import * as fs4 from "node:fs";
-import * as path4 from "node:path";
+import * as fs7 from "node:fs";
+import * as path7 from "node:path";
 
 // src/arxiv.ts
 var esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -78,22 +78,51 @@ function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
 var WIKI_DIR = "wiki";
+function parseFrontmatter(text) {
+  const out = {};
+  const m = text.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!m) return out;
+  for (const line of m[1].split("\n")) {
+    const mm = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!mm) continue;
+    const key = mm[1];
+    const val = mm[2].trim();
+    if (val.startsWith("[") && val.endsWith("]")) {
+      out[key] = val.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
+}
 function wikiPath(project, kind, id) {
   const safe = id.replace(/[^A-Za-z0-9_.-]/g, "_");
   return path.join(rlabDir(project), WIKI_DIR, kind, safe + ".md");
 }
 function writeWikiPage(project, page) {
   const p = wikiPath(project, page.kind, page.id);
+  const fm = [
+    "---",
+    "id: " + page.id,
+    "kind: " + page.kind,
+    "title: " + page.title.replace(/\n/g, " "),
+    "updated: " + page.updated,
+    page.tags?.length ? "tags: [" + page.tags.join(", ") + "]" : "tags: []",
+    "---",
+    ""
+  ].join("\n");
   const body = [
+    fm,
     "# " + page.title,
-    "",
-    "kind: " + page.kind + "  |  id: " + page.id + "  |  updated: " + page.updated + (page.tags?.length ? "  |  tags: " + page.tags.join(", ") : ""),
     "",
     page.content.trim(),
     ""
   ].join("\n");
   ensureDir(path.dirname(p));
   fs.writeFileSync(p, body, "utf8");
+  const log = path.join(rlabDir(project), "wiki", "log.md");
+  const stamp = (/* @__PURE__ */ new Date()).toISOString();
+  fs.appendFileSync(log, "- " + stamp + "  " + page.kind + ":" + page.id + "  " + page.title.replace(/[\r\n]+/g, " ") + "\n", "utf8");
   return p;
 }
 function listWiki(project) {
@@ -107,9 +136,10 @@ function listWiki(project) {
       if (!f.endsWith(".md")) continue;
       const full = path.join(dir, f);
       const text = fs.readFileSync(full, "utf8");
-      const title = (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, "");
-      const updated = (text.match(/updated: ([^|]+)/) || [])[1]?.trim() || "";
-      const tags = (text.match(/tags: (.+)/) || [])[1]?.split(",").map((s) => s.trim()).filter(Boolean) || [];
+      const fm = parseFrontmatter(text);
+      const title = String(fm.title || (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, ""));
+      const updated = String(fm.updated || "");
+      const tags = Array.isArray(fm.tags) ? fm.tags : fm.tags ? [String(fm.tags)] : [];
       pages.push({ kind, id: f.replace(/\.md$/, ""), title, updated, tags, content: "" });
     }
   }
@@ -524,6 +554,37 @@ function addDoc(project, title, body, source) {
   mineKeywords(project, 40);
   return Number(r.lastInsertRowid);
 }
+function ingestDocDir(project, dir, maxFiles = 200) {
+  const root = path2.resolve(dir);
+  if (!fs2.existsSync(root)) return { added: 0, skipped: 0 };
+  let added = 0, skipped = 0;
+  const walk = (d, depth) => {
+    if (depth > 4 || added >= maxFiles) return;
+    for (const f of fs2.readdirSync(d, { withFileTypes: true })) {
+      if (f.name.startsWith(".")) continue;
+      const full = path2.join(d, f.name);
+      if (f.isDirectory()) {
+        walk(full, depth + 1);
+        continue;
+      }
+      if (!f.name.endsWith(".md") && !f.name.endsWith(".mdx")) {
+        skipped++;
+        continue;
+      }
+      if (added >= maxFiles) return;
+      try {
+        const text = fs2.readFileSync(full, "utf8").slice(0, 2e4);
+        const rel = path2.relative(root, full);
+        addDoc(project, rel, text, "ingest:" + path2.basename(root));
+        added++;
+      } catch {
+        skipped++;
+      }
+    }
+  };
+  walk(root, 0);
+  return { added, skipped };
+}
 function topKeywords(project, topN = 30) {
   const db = openDb(project);
   return db.prepare("SELECT term, score, freq, docs FROM keywords ORDER BY score DESC LIMIT ?").all(topN);
@@ -775,12 +836,435 @@ async function suggestZh(query, max = 5) {
   return out;
 }
 
+// src/ref.ts
+import { execSync } from "node:child_process";
+import * as fs4 from "node:fs";
+import * as path4 from "node:path";
+function cloneAndStudy(url, outDir, maxTree = 30) {
+  const m = url.match(/github\.com\/([^\/]+)\/([^\/\s]+?)(?:\.git)?(?:\/|$)/);
+  if (!m) throw new Error("not a github.com URL: " + url);
+  const repo = m[1] + "/" + m[2].replace(/\.git$/, "");
+  fs4.mkdirSync(outDir, { recursive: true });
+  const dir = path4.join(outDir, m[2].replace(/\.git$/, ""));
+  execSync("git clone --depth 1 https://github.com/" + repo + '.git "' + dir + '"', { stdio: "pipe", timeout: 12e4 });
+  const head = (name2, n = 40) => {
+    const f = path4.join(dir, name2);
+    try {
+      return fs4.readFileSync(f, "utf8").slice(0, 1800);
+    } catch {
+      return "";
+    }
+  };
+  const readme = head("README.md") || head("README_EN.md") || head("README.adoc");
+  const claudeMd = head("CLAUDE.md") || head("AGENTS.md");
+  const tree = [];
+  const walk = (d, depth) => {
+    if (depth > 2 || tree.length >= maxTree) return;
+    for (const f of fs4.readdirSync(d, { withFileTypes: true })) {
+      if (f.name.startsWith(".") || f.name === "node_modules") continue;
+      const rel = path4.relative(dir, path4.join(d, f.name));
+      tree.push((depth ? "  ".repeat(depth) : "") + rel + (f.isDirectory() ? "/" : ""));
+      if (f.isDirectory()) walk(path4.join(d, f.name), depth + 1);
+    }
+  };
+  walk(dir, 0);
+  let files = 0;
+  const count = (d) => {
+    for (const f of fs4.readdirSync(d, { withFileTypes: true })) {
+      if (f.name.startsWith(".")) continue;
+      if (f.isDirectory()) count(path4.join(d, f.name));
+      else files++;
+    }
+  };
+  count(dir);
+  const note = [
+    "# Ref study: " + repo,
+    "",
+    "source: https://github.com/" + repo + "  |  cloned: " + (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+    "files: " + files,
+    "",
+    "## README (excerpt)",
+    "",
+    readme,
+    "",
+    claudeMd ? "## CLAUDE.md / AGENTS.md (excerpt - often reveals the real contract)" : "",
+    "",
+    claudeMd,
+    "",
+    "## Structure (top 2 levels)",
+    "",
+    "```",
+    ...tree,
+    "```",
+    "",
+    "## Absorption notes (fill in)",
+    "",
+    "| aspect | verdict |",
+    "|---|---|",
+    "| what it is |  |",
+    "| absorb-worthy mechanisms |  |",
+    "| code to port |  |",
+    "| conflicts with our design |  |",
+    "| license |  |",
+    ""
+  ];
+  const noteFile = path4.join(dir, "REF.md");
+  fs4.writeFileSync(noteFile, note.join("\n"), "utf8");
+  return { repo, dir, readme, claudeMd, tree, files, noteFile };
+}
+
+// src/index.ts
+import * as os2 from "node:os";
+
+// src/ocr.ts
+import * as fs5 from "node:fs";
+import * as os from "node:os";
+import * as path5 from "node:path";
+var JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
+var OCR_MODELS = ["PaddleOCR-VL-1.6", "PP-OCRv6"];
+function ocrToken() {
+  const fromEnv = process.env.PADDLE_OCR_TOKEN;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+  const f = path5.join(os.homedir(), ".dsh", "paddle-ocr.token");
+  try {
+    const t = fs5.readFileSync(f, "utf8").trim();
+    if (t) return t;
+  } catch {
+  }
+  throw new Error("PaddleOCR token not found \u2014 set env PADDLE_OCR_TOKEN or write it to " + f);
+}
+function bestPayload(model) {
+  if (model === "PaddleOCR-VL-1.6") {
+    return {
+      useDocOrientationClassify: true,
+      // rotated / portrait text
+      useDocUnwarping: true,
+      // curved/scan warping
+      useLayoutDetection: true,
+      // full layout analysis (titles/paragraphs/figures/tables)
+      useChartRecognition: true,
+      // charts incl. complex flow diagrams
+      layoutDetModelName: "large",
+      layoutShapeMode: "auto",
+      showFormulaNumber: true,
+      mergeTables: true,
+      // cross-page table merge
+      relevelTitles: true,
+      // heading levels
+      prettifyMarkdown: true,
+      visualize: false
+    };
+  }
+  return {
+    useDocOrientationClassify: true,
+    useDocUnwarping: true,
+    useTextlineOrientation: true,
+    textDetLimitSideLen: 128,
+    // higher-res text detection (default 64)
+    textDetLimitType: "min"
+  };
+}
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function submitLocal(abs, model, token) {
+  const fd = new FormData();
+  fd.append("model", model);
+  fd.append("optionalPayload", JSON.stringify(bestPayload(model)));
+  fd.append("file", new Blob([fs5.readFileSync(abs)]), path5.basename(abs));
+  const resp = await fetch(JOB_URL, { method: "POST", headers: { Authorization: "bearer " + token }, body: fd });
+  if (resp.status !== 200) throw new Error("submit failed " + resp.status + ": " + (await resp.text()).slice(0, 300));
+  const j = await resp.json();
+  return String(j.data.jobId);
+}
+var CT_EXT = { "application/pdf": "pdf", "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/bmp": "bmp", "image/tiff": "tiff" };
+async function downloadToTemp(file) {
+  const r = await fetch(file, { headers: { "User-Agent": "Mozilla/5.0 dsh-research-lab" } });
+  if (!r.ok) throw new Error("download failed " + r.status);
+  let name2 = path5.basename(new URL(file).pathname) || "doc";
+  name2 = name2.replace(/[^\w.-]+/g, "-");
+  const OK_EXT = ["pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff", "doc", "docx", "xls", "xlsx", "ppt", "pptx"];
+  const m = name2.match(/\.([a-z0-9]{2,5})$/i);
+  const ext = m ? m[1].toLowerCase() : "";
+  if (!OK_EXT.includes(ext)) {
+    const ct = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    const cext = CT_EXT[ct];
+    if (!cext) throw new Error("unsupported content-type from URL: " + ct);
+    name2 = name2.replace(/\.[^.]*$/, "") + "." + cext;
+  }
+  const tmp = path5.join(os.tmpdir(), "rlab-ocr-" + Date.now() + "-" + name2);
+  fs5.writeFileSync(tmp, Buffer.from(await r.arrayBuffer()));
+  return tmp;
+}
+async function submitJob(file, model, token) {
+  if (!/^https?:\/\//i.test(file)) {
+    const abs = path5.resolve(file);
+    if (!fs5.existsSync(abs)) throw new Error("file not found: " + abs);
+    return submitLocal(abs, model, token);
+  }
+  const resp = await fetch(JOB_URL, {
+    method: "POST",
+    headers: { Authorization: "bearer " + token, "Content-Type": "application/json" },
+    body: JSON.stringify({ fileUrl: file, model, optionalPayload: bestPayload(model) })
+  });
+  if (resp.status === 200) {
+    const j = await resp.json();
+    return String(j.data.jobId);
+  }
+  const tmp = await downloadToTemp(file);
+  try {
+    return await submitLocal(tmp, model, token);
+  } finally {
+    try {
+      fs5.unlinkSync(tmp);
+    } catch {
+    }
+  }
+}
+async function runOcr(file, model, opts = {}) {
+  const token = opts.token ?? ocrToken();
+  const started = Date.now();
+  const jobId = await submitJob(file, model, token);
+  const deadline = started + (opts.maxWaitMs ?? 3e5);
+  while (Date.now() < deadline) {
+    await sleep(opts.pollMs ?? 5e3);
+    const r = await fetch(JOB_URL + "/" + jobId, { headers: { Authorization: "bearer " + token } });
+    if (r.status !== 200) throw new Error("poll failed " + r.status + ": " + (await r.text()).slice(0, 200));
+    const j = await r.json();
+    const st = j.data.state;
+    if (st === "done") {
+      const url = j.data.resultUrl?.jsonUrl;
+      if (!url) throw new Error("job done but no result jsonUrl");
+      return { jobId, jsonlUrl: url, pages: j.data.extractProgress?.extractedPages ?? 0, ms: Date.now() - started };
+    }
+    if (st === "failed") throw new Error("OCR job failed: " + (j.data.errorMsg ?? "unknown error"));
+  }
+  throw new Error("OCR job timed out after " + Math.round((Date.now() - started) / 1e3) + "s (job " + jobId + ")");
+}
+async function fetchOcrMarkdown(jsonlUrl, outDir) {
+  fs5.mkdirSync(outDir, { recursive: true });
+  const r = await fetch(jsonlUrl);
+  if (!r.ok) throw new Error("result download failed " + r.status);
+  const parts = [];
+  let images = 0, chars = 0;
+  for (const line of r.text ? (await r.text()).split("\n").filter(Boolean) : []) {
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const res of obj.result?.layoutParsingResults ?? []) {
+      const md = res.markdown?.text ?? "";
+      if (md) {
+        parts.push(md);
+        chars += md.length;
+      }
+      const imgs = res.markdown?.images ?? {};
+      for (const [rel, url] of Object.entries(imgs)) {
+        try {
+          const ir = await fetch(url);
+          if (ir.ok) {
+            const p = path5.join(outDir, rel);
+            fs5.mkdirSync(path5.dirname(p), { recursive: true });
+            fs5.writeFileSync(p, Buffer.from(await ir.arrayBuffer()));
+            images++;
+          }
+        } catch {
+        }
+      }
+    }
+  }
+  if (!parts.length) throw new Error("no markdown content in OCR result");
+  const mdPath = path5.join(outDir, "doc.md");
+  const text = parts.join("\n\n---\n\n");
+  fs5.writeFileSync(mdPath, text, "utf8");
+  return { mdPath, pages: parts.length, images, chars, text };
+}
+
+// src/validate.ts
+import * as fs6 from "node:fs";
+import * as path6 from "node:path";
+var KINDS = ["experiment", "literature", "decision", "todo"];
+var REQUIRED_FIELDS = ["id", "kind", "title", "updated"];
+function parseFrontmatter2(text) {
+  if (!text.startsWith("---")) return { meta: {}, ok: false, err: "missing YAML frontmatter (must start with ---)" };
+  const end = text.indexOf("\n---", 4);
+  if (end < 0) return { meta: {}, ok: false, err: "unterminated frontmatter (missing closing ---)" };
+  const block = text.slice(3, end).trim();
+  const meta = {};
+  for (const line of block.split("\n")) {
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/);
+    if (m) meta[m[1].trim()] = m[2].trim().replace(/^["']|["']$/g, "");
+  }
+  return { meta, ok: true };
+}
+function validateWiki(project) {
+  const root = path6.join(rlabDir(project), "wiki");
+  const issues = [];
+  const graph = { edges: [], dangling: [], isolated: [] };
+  const pages = listWiki(project);
+  const idSet = new Set(pages.map((p) => p.id));
+  for (const kind of KINDS) {
+    const dir = path6.join(root, kind);
+    if (!fs6.existsSync(dir)) continue;
+    for (const f of fs6.readdirSync(dir)) {
+      if (!f.endsWith(".md") || f === "index.md") continue;
+      const full = path6.join(dir, f);
+      const text = fs6.readFileSync(full, "utf8");
+      const id = f.replace(/\.md$/, "");
+      const fm = parseFrontmatter2(text);
+      if (!fm.ok) {
+        issues.push({ page: kind + "/" + id, severity: "error", message: fm.err });
+        continue;
+      }
+      for (const field of REQUIRED_FIELDS) {
+        if (!fm.meta[field]) issues.push({ page: kind + "/" + id, severity: "error", message: "frontmatter missing required field: " + field });
+      }
+      if (fm.meta.kind && !KINDS.includes(fm.meta.kind)) {
+        issues.push({ page: kind + "/" + id, severity: "error", message: "invalid kind: " + fm.meta.kind });
+      }
+      if (fm.meta.id && fm.meta.id !== id) {
+        issues.push({ page: kind + "/" + id, severity: "error", message: 'frontmatter id "' + fm.meta.id + '" != filename "' + id + '"' });
+      }
+      const links = [...text.matchAll(/\[\[([A-Za-z0-9_.-]+)(?:\|[^\]]+)?\]\]/g)].map((m) => m[1]);
+      for (const to of links) {
+        if (idSet.has(to)) graph.edges.push({ from: id, to });
+        else graph.dangling.push(id + " -> " + to);
+      }
+    }
+  }
+  const backlinks = /* @__PURE__ */ new Map();
+  for (const e of graph.edges) backlinks.set(e.to, (backlinks.get(e.to) || 0) + 1);
+  for (const p of pages) {
+    const out = graph.edges.filter((e) => e.from === p.id).length;
+    if (out === 0 && (backlinks.get(p.id) || 0) === 0) graph.isolated.push(p.id);
+  }
+  const lines = ["# Wiki validation \u2014 " + project, ""];
+  lines.push("pages: " + pages.length + "   links: " + graph.edges.length + "   issues: " + issues.length);
+  lines.push("");
+  if (graph.dangling.length) {
+    lines.push("## \u26A0\uFE0F dangling links (" + graph.dangling.length + ")");
+    for (const d of graph.dangling.slice(0, 20)) lines.push("- " + d);
+    lines.push("");
+  }
+  if (graph.isolated.length) {
+    lines.push("## \u{1F3DD}\uFE0F isolated pages (no links in or out)");
+    for (const i of graph.isolated.slice(0, 20)) lines.push("- " + i);
+    lines.push("");
+  }
+  if (issues.length) {
+    lines.push("## \u274C issues (" + issues.length + ")");
+    for (const i of issues) lines.push("- [" + i.severity + "] " + i.page + ": " + i.message);
+  } else {
+    lines.push("## \u2705 all pages pass the \u03A9megaWiki contract");
+  }
+  lines.push("");
+  lines.push("### top backlinked");
+  const top = [...backlinks.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+  for (const [id, n] of top) lines.push("- " + id + "  (" + n + " backlinks)");
+  return lines.join("\n");
+}
+
+// src/latex.ts
+var PREAMBLE_ZH = [
+  "\\documentclass[11pt,a4paper]{article}",
+  "\\usepackage[UTF8]{ctex}",
+  "\\usepackage{geometry}",
+  "\\geometry{left=3.00cm,right=2.75cm,top=2.63cm,bottom=2.96cm}",
+  "\\usepackage{amsmath,amssymb,amsfonts,bm}",
+  "\\usepackage{graphicx,booktabs,multirow,array}",
+  "\\usepackage{hyperref}",
+  "\\CJKsetecglue{\\hskip 0.15em plus 0.05em minus 0.05em}",
+  "\\setlength{\\parindent}{2em} \\usepackage{indentfirst}"
+].join("\n");
+var TITLES = {
+  "paper-zh": "\u4E2D\u6587\u8BBA\u6587",
+  "thesis-zh": "\u5B66\u4F4D\u8BBA\u6587",
+  "nsfc-zh": "\u57FA\u91D1\u7533\u8BF7\u4E66",
+  "paper-en": "English Paper"
+};
+var BODY = {
+  "paper-zh": "\\section{\u5F15\u8A00}\n\\section{\u65B9\u6CD5}\n\\section{\u5B9E\u9A8C}\n\\section{\u7ED3\u8BBA}",
+  "thesis-zh": "\\chapter{\u7EEA\u8BBA}\n\\chapter{\u76F8\u5173\u5DE5\u4F5C}\n\\chapter{\u65B9\u6CD5}\n\\chapter{\u5B9E\u9A8C\u4E0E\u8BA8\u8BBA}\n\\chapter{\u7ED3\u8BBA\u4E0E\u5C55\u671B}",
+  "nsfc-zh": "\\section{\u7ACB\u9879\u4F9D\u636E}\n\\section{\u7814\u7A76\u5185\u5BB9\u4E0E\u76EE\u6807}\n\\section{\u7814\u7A76\u65B9\u6848\u4E0E\u6280\u672F\u8DEF\u7EBF}\n\\section{\u521B\u65B0\u70B9}",
+  "paper-en": "\\section{Introduction}\n\\section{Method}\n\\section{Experiments}\n\\section{Conclusion}"
+};
+function genLatex(kind, meta = {}) {
+  const zh = kind !== "paper-en";
+  const lines = [];
+  lines.push("% rlab_latex: " + TITLES[kind] + " skeleton (XeLaTeX)");
+  lines.push(PREAMBLE_ZH);
+  lines.push("\\title{" + (meta.title ?? "\u5F85\u5B9A\u6807\u9898") + "}");
+  lines.push("\\author{" + (meta.author ?? "\u4F5C\u8005") + (meta.affiliation ? "\\thanks{" + meta.affiliation + "}" : "") + "}");
+  lines.push("\\date{\\today}");
+  lines.push("\\begin{document}");
+  lines.push("\\maketitle");
+  if (meta.abstract) lines.push((zh ? "\\begin{abstract}" : "\\begin{abstract}") + meta.abstract + (zh ? "\\end{abstract}" : "\\end{abstract}"));
+  if (meta.keywords) lines.push("\\noindent\\textbf{" + (zh ? "\u5173\u952E\u8BCD" : "Keywords") + ":} " + meta.keywords);
+  lines.push(BODY[kind]);
+  if (meta.extra) lines.push(meta.extra);
+  lines.push("\\end{document}");
+  return lines.join("\n");
+}
+function lintLatex(text) {
+  const issues = [];
+  if (!/\\documentclass/.test(text)) issues.push("\u26A0\uFE0F \u7F3A\u5C11 \\documentclass");
+  if (/[""„“”]/.test(text)) issues.push("\u26A0\uFE0F \u53D1\u73B0\u76F4\u5F15\u53F7/\u5F2F\u5F15\u53F7\u6DF7\u7528: \u4E2D\u6587\u5E94\u4F7F\u7528 \u201C \u201D \u6216 \u201C\u201D \u5168\u89D2\u5F15\u53F7");
+  const b = (text.match(/\\begin\{([a-z*]+)\}/g) ?? []).map((s) => s.replace(/\\begin\{(.+)\}/, "$1"));
+  const e = (text.match(/\\end\{([a-z*]+)\}/g) ?? []).map((s) => s.replace(/\\end\{(.+)\}/, "$1"));
+  for (const env of /* @__PURE__ */ new Set([...b, ...e])) {
+    const nb = b.filter((x) => x === env).length, ne = e.filter((x) => x === env).length;
+    if (nb !== ne) issues.push("\u274C begin/end \u4E0D\u914D\u5BF9: " + env + " (" + nb + "/" + ne + ")");
+  }
+  const ds = (text.match(/\$/g) ?? []).length;
+  if (ds % 2 !== 0) issues.push("\u274C $ \u6570\u91CF\u4E3A\u5947\u6570 (" + ds + "), \u6570\u5B66\u6A21\u5F0F\u672A\u95ED\u5408");
+  if (text.includes("\\citep{") || text.includes("\\cite{")) issues.push("\u2139\uFE0F \u5F15\u7528\u5EFA\u8BAE\u4F7F\u7528 biblatex: \\addbibresource + \\parencite");
+  if (text.includes("  ")) issues.push("\u2139\uFE0F \u5B58\u5728\u8FDE\u7EED\u7A7A\u683C (TeX \u4F1A\u6298\u53E0, \u5EFA\u8BAE\u68C0\u67E5)");
+  return issues.length ? issues.join("\n") : "\u2705 \u672A\u53D1\u73B0\u660E\u663E\u95EE\u9898";
+}
+var LATEX_KINDS = ["paper-zh", "thesis-zh", "nsfc-zh", "paper-en"];
+
 // src/index.ts
 var textOut = { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: String(v) }] };
 var today = () => (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
 var name = "dsh-research-lab";
 var inject = ["tools"];
 async function apply(ctx) {
+  ctx.tools.register(defineTool({
+    name: "rlab_validate",
+    description: "Validate a research-wiki against the \u03A9megaWiki contract: frontmatter schema (id/kind/title/updated), kind legality, id-filename consistency, [[wikilink]] bidirectional graph, dangling and isolated pages. Run after rlab_wiki batches or before publishing.".replace(/ΩmegaWiki contract/, "\u03A9megaWiki contract"),
+    parameters: {
+      project: { type: "string", required: true, description: "absolute path to the research project root" }
+    },
+    output: textOut,
+    timeoutMs: 15e3,
+    async execute(args) {
+      const project = String(args?.project ?? "").trim();
+      if (!project) throw new Error("project required");
+      return validateWiki(project);
+    }
+  }));
+  ctx.tools.register(defineTool({
+    name: "rlab_latex",
+    description: "Scaffold a Chinese/English research LaTeX document (paper/thesis/NSFC skeleton with ctex + xeCJK preamble) or lint an existing .tex for common issues (unpaired begin/end, odd dollar count, quote style). Zero-dependency pure template registry (hono-style).".replace(/hono-style/, "hono-style"),
+    parameters: {
+      kind: { type: "string", required: true, description: "paper-zh | thesis-zh | nsfc-zh | paper-en" },
+      title: { type: "string", description: "document title" },
+      author: { type: "string", description: "author name" },
+      affiliation: { type: "string", description: "affiliation (as \\thanks)" },
+      keywords: { type: "string", description: "comma-separated keywords" },
+      abstract: { type: "string", description: "abstract text" },
+      text: { type: "string", description: "existing .tex content to lint (when set, lints instead of generating)" }
+    },
+    output: textOut,
+    timeoutMs: 15e3,
+    async execute(args) {
+      const kind = String(args?.kind ?? "").trim();
+      const text = String(args?.text ?? "").trim();
+      if (text) return lintLatex(text);
+      if (!LATEX_KINDS.includes(kind)) throw new Error("kind must be one of: " + LATEX_KINDS.join(", "));
+      return genLatex(kind, { title: args?.title, author: args?.author, affiliation: args?.affiliation, keywords: args?.keywords, abstract: args?.abstract });
+    }
+  }));
   ctx.tools.register(defineTool({
     name: "rlab_wiki",
     description: "Write a research-wiki page under <project>/.rlab/wiki/<kind>/ and rebuild the index (AutoSci-style durable lab notes). Kinds: experiment (what you ran), literature (paper notes), decision (why you chose X \u2014 ADRs), todo (open items). Pages are plain markdown; read them with the read tool. Returns the written path.",
@@ -790,7 +1274,7 @@ async function apply(ctx) {
       id: { type: "string", required: true, description: "short kebab id, e.g. m10-contrastive or arxiv-2602.04770" },
       title: { type: "string", required: true, description: "page title" },
       content: { type: "string", required: true, description: "markdown body" },
-      tags: { type: "array", required: false, description: "optional tags" }
+      tags: { type: "array", description: "optional tags" }
     },
     output: textOut,
     timeoutMs: 15e3,
@@ -809,7 +1293,14 @@ async function apply(ctx) {
         tags: args?.tags
       });
       const idx = rebuildWikiIndex(project);
-      return "Wrote " + p + "\nIndex: " + idx;
+      let ix = "";
+      try {
+        addDoc(project, "wiki/" + kind + "/" + id, String(args?.title ?? id) + "\n\n" + String(args?.content ?? ""), "wiki");
+        ix = "\nIndexed into related.db \u2014 now searchable via rlab_related.";
+      } catch {
+        ix = "\n(related.db index skipped \u2014 db unavailable)";
+      }
+      return "Wrote " + p + "\nIndex: " + idx + ix;
     }
   }));
   ctx.tools.register(defineTool({
@@ -821,11 +1312,11 @@ async function apply(ctx) {
       task: { type: "string", required: true, description: "task name, e.g. STS12 or MTEB-Multilingual-v2" },
       score: { type: "number", required: true, description: "the metric value" },
       metric: { type: "string", required: true, description: "cos_sim.spearman | ndcg_at_10 | accuracy | ..." },
-      split: { type: "string", required: false, description: "test | dev | validation (default test)" },
-      hf_subset: { type: "string", required: false, description: "huggingface subset when task has one" },
-      prompt_type: { type: "string", required: false, description: "e.g. query|passage, or none" },
-      seed: { type: "number", required: false, description: "seed if stochastic" },
-      note: { type: "string", required: false, description: 'free note, e.g. "batch 128, fp32, compile off"' }
+      split: { type: "string", description: "test | dev | validation (default test)" },
+      hf_subset: { type: "string", description: "huggingface subset when task has one" },
+      prompt_type: { type: "string", description: "e.g. query|passage, or none" },
+      seed: { type: "number", description: "seed if stochastic" },
+      note: { type: "string", description: 'free note, e.g. "batch 128, fp32, compile off"' }
     },
     output: textOut,
     timeoutMs: 1e4,
@@ -858,7 +1349,7 @@ async function apply(ctx) {
       project: { type: "string", required: true, description: "absolute path to the research project root" },
       id: { type: "string", required: true, description: "short kebab id, e.g. v4-permcons" },
       hypothesis: { type: "string", required: true, description: "what you believed and why (with references)" },
-      prediction: { type: "string", required: false, description: 'falsifiable prediction + decision rule, e.g. "STS12 >= 0.5 \u2192 mechanism works"' },
+      prediction: { type: "string", description: 'falsifiable prediction + decision rule, e.g. "STS12 >= 0.5 \u2192 mechanism works"' },
       evidence: { type: "string", required: true, description: "what actually happened: numbers, logs, artifacts" },
       verdict: { type: "string", required: true, description: "confirmed | refuted | inconclusive" },
       conclusion: { type: "string", required: true, description: "what this changes for the project" }
@@ -901,8 +1392,8 @@ async function apply(ctx) {
     description: "Pull an arXiv paper by id (or abs URL) and produce a structured adversarial review checklist (ChatPaper summary + ASI-Bench rigor): contribution, method, evidence strength, baseline fairness, flaws, reproducibility. The checklist is the same one you should apply to your OWN paper before submission.",
     parameters: {
       arxivId: { type: "string", required: true, description: "e.g. 2602.04770 or full https://arxiv.org/abs/2602.04770 URL" },
-      focus: { type: "string", required: false, description: 'what to look for, e.g. "is the eval protocol sound?"' },
-      outputFile: { type: "string", required: false, description: "optional absolute path to write the review markdown" }
+      focus: { type: "string", description: 'what to look for, e.g. "is the eval protocol sound?"' },
+      outputFile: { type: "string", description: "optional absolute path to write the review markdown" }
     },
     output: textOut,
     timeoutMs: 6e4,
@@ -951,8 +1442,8 @@ async function apply(ctx) {
       const text = lines.join("\n");
       const outFile = args?.outputFile ? String(args.outputFile) : "";
       if (outFile) {
-        fs4.mkdirSync(path4.dirname(path4.resolve(outFile)), { recursive: true });
-        fs4.writeFileSync(outFile, text + "\n", "utf8");
+        fs7.mkdirSync(path7.dirname(path7.resolve(outFile)), { recursive: true });
+        fs7.writeFileSync(outFile, text + "\n", "utf8");
         return "Review written to " + outFile + "\n\n" + text;
       }
       return text;
@@ -964,8 +1455,9 @@ async function apply(ctx) {
     parameters: {
       project: { type: "string", required: true, description: "absolute path to the research project root" },
       queries: { type: "array", required: true, description: 'search terms, e.g. ["embedding distillation", "efficient retrieval"]' },
-      maxPerQuery: { type: "number", required: false, description: "papers per query (default 10, max 30)" },
-      withSummary: { type: "boolean", required: false, description: "include 500-char abstracts (default false)" }
+      maxPerQuery: { type: "number", description: "papers per query (default 10, max 30)" },
+      withSummary: { type: "boolean", description: "include 500-char abstracts (default false)" },
+      wiki: { type: "boolean", description: "also write every paper as a literature wiki page and index into related.db (default false)" }
     },
     output: textOut,
     timeoutMs: 12e4,
@@ -991,13 +1483,29 @@ async function apply(ctx) {
       }
       all.sort((a, b) => (b.published || "").localeCompare(a.published || ""));
       const date = today();
-      const dir = path4.join(rlabDir(project), "digests");
-      fs4.mkdirSync(dir, { recursive: true });
-      const file = path4.join(dir, date + ".md");
+      const dir = path7.join(rlabDir(project), "digests");
+      fs7.mkdirSync(dir, { recursive: true });
+      const file = path7.join(dir, date + ".md");
       const lines = ["# arXiv digest \u2014 " + date, "", "queries: " + queries.join(" | "), "papers: " + all.length, ""];
       lines.push(formatPapers(all, withSummary));
-      fs4.writeFileSync(file, lines.join("\n") + "\n", "utf8");
-      return "Digest written to " + file + " (" + all.length + " papers)\n\n" + formatPapers(all.slice(0, 10), withSummary);
+      fs7.writeFileSync(file, lines.join("\n") + "\n", "utf8");
+      let wikiCount = 0;
+      if (args?.wiki === true) {
+        const wseen = /* @__PURE__ */ new Set();
+        for (const p of all) {
+          if (!p.id || p.id === "ERR" || wseen.has(p.id)) continue;
+          wseen.add(p.id);
+          try {
+            const slug = p.id.replace(/[^\w-]+/g, "").slice(0, 60);
+            const content = "## Title\n" + p.title + "\n\n## Authors\n" + (p.authors || []).join(", ").slice(0, 300) + "\n\n## Abstract\n" + (p.summary || "").slice(0, 1200) + "\n\n## Links\n- " + (p.absUrl || "") + "\n- " + (p.pdfUrl || "");
+            writeWikiPage(project, { kind: "literature", id: slug, title: String(p.title).slice(0, 120), updated: today(), content, tags: ["arxiv", ...(p.categories || []).slice(0, 3)] });
+            addDoc(project, "wiki/literature/" + slug, String(p.title) + "\n\n" + (p.summary || ""), "arxiv:" + p.id);
+            wikiCount++;
+          } catch {
+          }
+        }
+      }
+      return "Digest written to " + file + " (" + all.length + " papers" + (wikiCount ? ", " + wikiCount + " wiki pages written" : "") + ")\n\n" + formatPapers(all.slice(0, 10), withSummary);
     }
   }));
   ctx.tools.register(defineTool({
@@ -1081,10 +1589,10 @@ async function apply(ctx) {
     parameters: {
       project: { type: "string", required: true, description: "absolute path to the research project root" },
       action: { type: "string", required: true, description: "extract | cite | list" },
-      text: { type: "string", required: false, description: "paper text to extract from (action=extract)" },
-      docId: { type: "number", required: false, description: "indexed doc id to extract from (action=extract)" },
-      claimId: { type: "number", required: false, description: "claim id to cite (action=cite)" },
-      type: { type: "string", required: false, description: "filter list by claim type" }
+      text: { type: "string", description: "paper text to extract from (action=extract)" },
+      docId: { type: "number", description: "indexed doc id to extract from (action=extract)" },
+      claimId: { type: "number", description: "claim id to cite (action=cite)" },
+      type: { type: "string", description: "filter list by claim type" }
     },
     output: textOut,
     timeoutMs: 2e4,
@@ -1123,19 +1631,37 @@ async function apply(ctx) {
     }
   }));
   ctx.tools.register(defineTool({
+    name: "rlab_ref",
+    description: "Shallow-clone a public GitHub repo and auto-generate a study note (REF.md): README/CLAUDE.md excerpts, 2-level tree, file count, absorption-decision table to fill in. The zero-config research habit: new reference project -> study note in seconds. Also indexable via rlab_related ingest.",
+    parameters: {
+      project: { type: "string", required: true, description: "absolute path to the research project root (refs go to <project>/.rlab/refs/)" },
+      url: { type: "string", required: true, description: "github.com URL, e.g. https://github.com/skyllwt/AutoSci" }
+    },
+    output: textOut,
+    timeoutMs: 15e4,
+    async execute(args) {
+      const project = String(args?.project ?? "").trim();
+      const url = String(args?.url ?? "").trim();
+      if (!project || !url) throw new Error("project and url required");
+      const res = cloneAndStudy(url, path7.join(rlabDir(project), "refs"));
+      return "Cloned " + res.repo + " -> " + res.dir + " (" + res.files + " files)" + String.fromCharCode(10) + "Study note: " + res.noteFile + String.fromCharCode(10) + String.fromCharCode(10) + "## README excerpt" + String.fromCharCode(10) + res.readme.slice(0, 400) + String.fromCharCode(10) + String.fromCharCode(10) + "## Structure" + String.fromCharCode(10) + res.tree.slice(0, 15).join(String.fromCharCode(10));
+    }
+  }));
+  ctx.tools.register(defineTool({
     name: "rlab_related",
     description: "Self-building keyword retrieval over a project document store (NLP + SQLite FTS5, zero deps). NO preset lexicon: terms are mined from the corpus via TF-IDF (English words + Chinese n-grams) and the lexicon grows with every added doc. Actions: add (index a doc), search (FTS5), expand (iterative relevance feedback: search \u2192 mine new terms from top hits \u2192 merge into query \u2192 repeat, rounds=1..4), keywords (show the auto-built lexicon), list (all docs). DB at <project>/.rlab/related.db.",
     parameters: {
       project: { type: "string", required: true, description: "absolute path to the research project root" },
-      action: { type: "string", required: true, description: "add | search | expand | keywords | list" },
-      title: { type: "string", required: false, description: "doc title (add)" },
-      body: { type: "string", required: false, description: "doc body/text (add)" },
-      source: { type: "string", required: false, description: "origin, e.g. arxiv:2602.04770 or file path (add)" },
-      query: { type: "string", required: false, description: "search query (search/expand), plain words, zh or en" },
-      k: { type: "number", required: false, description: "results per round (default 8, max 20)" },
-      rounds: { type: "number", required: false, description: "expansion rounds (default 2, max 4)" },
-      external: { type: "boolean", required: false, description: "also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)" },
-      topN: { type: "number", required: false, description: "lexicon size for keywords (default 30)" }
+      action: { type: "string", required: true, description: "add | search | expand | keywords | list | ingest" },
+      title: { type: "string", description: "doc title (add)" },
+      body: { type: "string", description: "doc body/text (add)" },
+      source: { type: "string", description: "origin, e.g. arxiv:2602.04770 or file path (add)" },
+      query: { type: "string", description: "search query (search/expand), plain words, zh or en" },
+      k: { type: "number", description: "results per round (default 8, max 20)" },
+      rounds: { type: "number", description: "expansion rounds (default 2, max 4)" },
+      external: { type: "boolean", description: "also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)" },
+      topN: { type: "number", description: "lexicon size for keywords (default 30)" },
+      dir: { type: "string", description: "directory to bulk-ingest (ingest). Default: auto-detect .dsh-lib-analyzer/pages, .rlab/wiki, batch/out" }
     },
     output: textOut,
     timeoutMs: 6e4,
@@ -1184,6 +1710,23 @@ async function apply(ctx) {
           lines.push("", "## Auto-built lexicon (top " + res.lexicon.length + ")", res.lexicon.slice(0, 15).map((x) => x.term + "  score=" + x.score.toFixed(2) + " freq=" + x.freq + " docs=" + x.docs).join("\n"));
           return lines.join("\n");
         }
+        case "ingest": {
+          const dir = String(args?.dir ?? "").trim();
+          const cands = dir ? [dir] : [path7.join(project, ".dsh-lib-analyzer", "pages"), path7.join(project, ".rlab", "wiki"), path7.join(project, "batch", "out")];
+          const parts = [];
+          let total = 0, skipped = 0;
+          for (const cdir of cands) {
+            if (!fs7.existsSync(cdir)) {
+              if (dir) throw new Error("dir not found: " + cdir);
+              continue;
+            }
+            const res = ingestDocDir(project, cdir);
+            total += res.added;
+            skipped += res.skipped;
+            parts.push(path7.basename(cdir) + ":+" + res.added);
+          }
+          return "Ingested " + total + " files (skipped " + skipped + ") \u2014 " + (parts.join(" | ") || "(no ingest dirs found \u2014 pass dir=)") + "\nLexicon updated automatically. Try search or expand now.";
+        }
         case "keywords": {
           const kw = topKeywords(project, topN);
           if (!kw.length) return "Lexicon empty \u2014 add docs first (rlab_related action=add).";
@@ -1196,8 +1739,98 @@ async function apply(ctx) {
           return "Docs (" + rows.length + "):\n" + rows.map((x) => "\u2022 #" + x.id + " " + x.title + (x.source ? "  (" + x.source + ")" : "") + "  " + x.added).join("\n");
         }
         default:
-          throw new Error("action must be add|search|expand|keywords|list");
+          throw new Error("action must be add|search|expand|keywords|list|ingest");
       }
+    }
+  }));
+  ctx.tools.register(defineTool({
+    name: "rlab_ocr",
+    description: "Submit a document (local file path or http(s) URL) to PaddleOCR cloud and auto-ingest it into the research lab: downloads markdown + images into <project>/ocr/<name>/, indexes into related.db, optionally writes a literature wiki page. Models: PaddleOCR-VL-1.6 (all-round: complex layouts, flow charts) | PP-OCRv6 (light: fixed charts). Quality-max params enabled. Token from env PADDLE_OCR_TOKEN or ~/.dsh/paddle-ocr.token (never hardcoded). Free quota 20000 pages/day per model.",
+    parameters: {
+      file: { type: "string", required: true, description: "local file path or http(s) URL of the document (PDF/PNG/JPG...) to OCR" },
+      model: { type: "string", description: "PaddleOCR-VL-1.6 (default, all-round) | PP-OCRv6 (light)" },
+      project: { type: "string", description: "research project root \u2014 used for outDir/index/wiki (optional)" },
+      outDir: { type: "string", description: "output dir for markdown+images (default <project>/ocr/<name>/ or ~/dsh-ocr/<name>/)" },
+      index: { type: "boolean", description: "index the markdown into related.db (default true)" },
+      wiki: { type: "boolean", description: "also write a literature wiki page (default false)" },
+      maxWaitMs: { type: "number", description: "job poll timeout in ms (default 300000)" }
+    },
+    output: textOut,
+    timeoutMs: 6e5,
+    async execute(args) {
+      const file = String(args?.file ?? "").trim();
+      if (!file) throw new Error("file required (local path or http(s) URL)");
+      const model = String(args?.model ?? "PaddleOCR-VL-1.6").trim();
+      if (!OCR_MODELS.includes(model)) throw new Error("model must be " + OCR_MODELS.join(" | "));
+      const project = String(args?.project ?? "").trim();
+      const t0 = Date.now();
+      const job = await runOcr(file, model, { maxWaitMs: Number(args?.maxWaitMs) || 3e5 });
+      const base = path7.basename(file).replace(/\.[^.]+$/, "").replace(/[^\w\u4e00-\u9fff-]+/g, "-").slice(0, 60) || "doc";
+      const outDir = String(args?.outDir ?? "").trim() || (project ? path7.join(project, "ocr", base) : path7.join(os2.homedir(), "dsh-ocr", base));
+      const md = await fetchOcrMarkdown(job.jsonlUrl, outDir);
+      const lines = [
+        "\u2705 OCR done: " + file,
+        "model: " + model + "  pages: " + md.pages + "  chars: " + md.chars + "  images: " + md.images + "  time: " + Math.round((Date.now() - t0) / 1e3) + "s",
+        "md: " + md.mdPath
+      ];
+      if (project && args?.index !== false) {
+        const id = addDoc(project, "ocr/" + base + "/doc.md", md.text, "paddleocr:" + model);
+        lines.push("indexed into related.db: doc #" + id);
+      }
+      if (project && args?.wiki === true) {
+        const p = writeWikiPage(project, { kind: "literature", id: base, title: base + " (OCR)", updated: today(), content: md.text.slice(0, 4e3) + "\n\n---\nSource: " + file + " (PaddleOCR " + model + ")", tags: ["ocr"] });
+        lines.push("wiki page: " + p);
+      }
+      lines.push("quota note: 20000 free pages/day per model");
+      return lines.join("\n");
+    }
+  }));
+  ctx.tools.register(defineTool({
+    name: "rlab_absorb",
+    description: "Auto-absorb dsh-lib-analyzer reports into the research wiki + related.db: scans batch/out and .dsh-lib-analyzer/pages for .md reports and writes each as a wiki page (kind=experiment by default) and indexes it. The zero-friction loop: libreport sinks a knowledge page -> run this -> it becomes wiki literature/experiment pages searchable via rlab_related.",
+    parameters: {
+      project: { type: "string", required: true, description: "absolute path to the research project root" },
+      dir: { type: "string", description: "directory to scan (default: auto-detect batch/out + .dsh-lib-analyzer/pages)" },
+      kind: { type: "string", description: "wiki kind: experiment (default) | literature | decision" },
+      max: { type: "number", description: "max reports to absorb (default 50)" }
+    },
+    output: textOut,
+    timeoutMs: 6e4,
+    async execute(args) {
+      const project = String(args?.project ?? "").trim();
+      if (!project) throw new Error("project required");
+      const kind = String(args?.kind ?? "experiment").trim();
+      if (!["experiment", "literature", "decision"].includes(kind)) throw new Error("kind must be experiment|literature|decision");
+      const max = Number(args?.max) || 50;
+      const dirs = String(args?.dir ?? "").trim() ? [String(args?.dir).trim()] : [path7.join(project, "batch", "out"), path7.join(project, ".dsh-lib-analyzer", "pages")];
+      let written = 0, indexed = 0, skipped = 0;
+      const files = [];
+      for (const d of dirs) {
+        if (!fs7.existsSync(d)) continue;
+        const walk = (p) => {
+          for (const f of fs7.readdirSync(p, { withFileTypes: true })) {
+            if (f.name.startsWith(".")) continue;
+            const full = path7.join(p, f.name);
+            if (f.isDirectory()) walk(full);
+            else if (f.name.endsWith(".md") && files.length < max) files.push(full);
+          }
+        };
+        walk(d);
+      }
+      for (const f of files) {
+        try {
+          const text = fs7.readFileSync(f, "utf8").slice(0, 2e4);
+          const rel = path7.relative(project, f).replace(/\\/g, "/");
+          const slug = path7.basename(f, ".md").replace(/[^\w\u4e00-\u9fff-]+/g, "-").slice(0, 60) || "report";
+          writeWikiPage(project, { kind, id: slug, title: slug + " (absorbed)", updated: today(), content: text.slice(0, 5e3) + "\n\n---\nSource: " + rel, tags: ["absorb", path7.basename(path7.dirname(f))] });
+          addDoc(project, rel, text, "absorb");
+          written++;
+          indexed++;
+        } catch {
+          skipped++;
+        }
+      }
+      return "Absorbed " + written + " reports (" + files.length + " found, " + skipped + " skipped) from: " + (dirs.filter((d) => fs7.existsSync(d)).join(", ") || "(no dirs)") + "\nwiki pages: " + written + " | related.db docs: " + indexed;
     }
   }));
   ctx.tools.register(defineTool({
@@ -1212,7 +1845,7 @@ async function apply(ctx) {
       const project = String(args?.project ?? "").trim();
       if (!project) throw new Error("project required");
       const dir = rlabDir(project);
-      if (!fs4.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
+      if (!fs7.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
       const pages = listWiki(project);
       const count = (k) => pages.filter((p) => p.kind === k).length;
       const benchRows = readBench(project);
