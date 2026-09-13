@@ -4,17 +4,66 @@ import * as fs7 from "node:fs";
 import * as path7 from "node:path";
 
 // src/arxiv.ts
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 var esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+var THROTTLE_FILE = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), ".arxiv-throttle");
+var MIN_GAP_MS = 3100;
+async function gate() {
+  for (; ; ) {
+    let last = 0;
+    try {
+      last = Number(readFileSync(THROTTLE_FILE, "utf8")) || 0;
+    } catch {
+      last = 0;
+    }
+    const wait = last + MIN_GAP_MS - Date.now();
+    if (wait <= 0) break;
+    await sleep(wait);
+  }
+  try {
+    mkdirSync(dirname(THROTTLE_FILE), { recursive: true });
+    writeFileSync(THROTTLE_FILE, String(Date.now()));
+  } catch {
+  }
+}
+function retryAfterMs(header) {
+  const n = Number(String(header ?? "").trim());
+  return Number.isFinite(n) && n > 0 ? Math.min(n * 1e3, 6e4) : 0;
+}
 async function arxivQuery(params) {
   const qs = new URLSearchParams(params).toString();
   const url = "https://export.arxiv.org/api/query?" + qs;
-  const fetchOne = () => fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (dsh-research-lab/0.1)" }, signal: AbortSignal.timeout(3e4) });
-  let res = await fetchOne();
-  if (res.status === 429) {
-    await new Promise((r) => setTimeout(r, 1500));
-    res = await fetchOne();
+  const fetchOne = () => {
+    const headers = { "User-Agent": "dsh-research-lab/0.2 (local research agent; arxiv api client; +https://info.arxiv.org/help/api/)" };
+    return fetch(url, { headers, signal: AbortSignal.timeout(15e3) });
+  };
+  const delays = [0, 4e3, 12e3];
+  let res = null;
+  let asked = 0;
+  let last = "";
+  for (let i = 0; i < delays.length; i++) {
+    const wait = Math.max(delays[i], i > 0 ? asked : 0);
+    if (wait > 0) await sleep(wait);
+    asked = 0;
+    try {
+      await gate();
+      res = await fetchOne();
+    } catch (err) {
+      last = String(err.message ?? err).slice(0, 120);
+      continue;
+    }
+    if (res.status === 429 || res.status === 503) {
+      asked = retryAfterMs(res.headers.get("retry-after"));
+      last = "HTTP " + res.status + " (arXiv rate limit: ~1 request per 3s; a burst gets the IP temporarily blocked)" + (asked ? "; server asked to wait " + Math.round(asked / 1e3) + "s" : "");
+      continue;
+    }
+    if (!res.ok) throw new Error("arXiv HTTP " + res.status);
+    break;
   }
-  if (!res.ok) throw new Error("arXiv HTTP " + res.status);
+  if (res == null || !res.ok) throw new Error("arXiv: " + (last || "unreachable after 3 attempts"));
   const xml = await res.text();
   const papers = [];
   const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
@@ -550,17 +599,33 @@ function hybridSearch(project, query, k = 10) {
 }
 function addDoc(project, title, body, source) {
   const db = openDb(project);
-  const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(title, ftsText(title + " " + body), source);
+  const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
+  const safeBody = typeof body === "string" ? body : "";
+  const safeSource = typeof source === "string" ? source : "";
+  const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(safeTitle, ftsText(safeTitle + " " + safeBody), safeSource);
   mineKeywords(project, 40);
   return Number(r.lastInsertRowid);
 }
 function ingestDocDir(project, dir, maxFiles = 200) {
   const root = path2.resolve(dir);
   if (!fs2.existsSync(root)) return { added: 0, skipped: 0 };
+  let isDirectory = false;
+  try {
+    isDirectory = fs2.statSync(root).isDirectory();
+  } catch {
+    isDirectory = false;
+  }
+  if (!isDirectory) return { added: 0, skipped: 0 };
   let added = 0, skipped = 0;
   const walk = (d, depth) => {
     if (depth > 4 || added >= maxFiles) return;
-    for (const f of fs2.readdirSync(d, { withFileTypes: true })) {
+    let entries = [];
+    try {
+      entries = fs2.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const f of entries) {
       if (f.name.startsWith(".")) continue;
       const full = path2.join(d, f.name);
       if (f.isDirectory()) {
@@ -610,6 +675,76 @@ function expandSearch(project, seed, rounds = 2, k = 8) {
     query = [query, ...newTerms].join(" OR ");
   }
   return { rounds: report, final, lexicon: topKeywords(project, 30) };
+}
+
+// src/acp.ts
+import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
+import { existsSync as existsSync3 } from "node:fs";
+import { join as join4 } from "node:path";
+import { homedir as homedir2 } from "node:os";
+function ftsPhrase(q) {
+  const toks = String(q ?? "").toLowerCase().replace(/["'^*:()\[\]{}]/g, " ").split(/\s+/).filter((t) => t.length > 1).slice(0, 8);
+  return toks.length ? toks.map((t) => '"' + t + '"*').join(" OR ") : '""';
+}
+function acpGraphPath() {
+  return join4(process.env.DSH_HOME ?? join4(homedir2(), ".dsh"), "graph", "graph.db");
+}
+function warn(what, err) {
+  console.warn("[dsh-research-lab] " + what + ":", err instanceof Error ? err.message : String(err));
+}
+function acpGraphAvailable() {
+  try {
+    if (!existsSync3(acpGraphPath())) return false;
+    const db = new DatabaseSync2(acpGraphPath(), { readOnly: true });
+    try {
+      const row = db.prepare("SELECT COUNT(*) AS c FROM checkpoints").get();
+      return (row?.c ?? 0) > 0;
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    warn("ACP graph probe failed", err);
+    return false;
+  }
+}
+function acpGraphRecall(query, limit = 4) {
+  try {
+    if (!acpGraphAvailable()) return [];
+    const db = new DatabaseSync2(acpGraphPath(), { readOnly: true });
+    try {
+      const q = String(query ?? "").toLowerCase().trim();
+      if (!q) return [];
+      const matchQ = ftsPhrase(q);
+      const out = [];
+      try {
+        const rows = db.prepare("SELECT id FROM node_fts WHERE node_fts MATCH ? LIMIT ?").all(matchQ, limit);
+        for (const r of rows) {
+          const cps = db.prepare("SELECT c.summary FROM checkpoints c JOIN checkpoint_nodes cn ON cn.session_id=c.session_id AND cn.seq_start=c.seq_start WHERE cn.node_id=? ORDER BY c.created_at DESC LIMIT 1").all(r.id);
+          if (cps.length) out.push({ node: r.id, summary: cps[0].summary, score: 1 });
+        }
+      } catch {
+      }
+      try {
+        const cps = db.prepare("SELECT session_id, seq_start, summary FROM cp_fts WHERE cp_fts MATCH ? LIMIT ?").all(matchQ, limit);
+        for (const c of cps) out.push({ node: "cp:" + c.session_id + ":" + c.seq_start, summary: c.summary, score: 0.8 });
+      } catch {
+      }
+      const seen = /* @__PURE__ */ new Set();
+      const dedup = [];
+      for (const o of out) {
+        if (!seen.has(o.node)) {
+          seen.add(o.node);
+          dedup.push(o);
+        }
+      }
+      return dedup.slice(0, limit);
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    warn("ACP recall failed", err);
+    return [];
+  }
 }
 
 // src/rewrite.ts
@@ -964,7 +1099,7 @@ function bestPayload(model) {
     textDetLimitType: "min"
   };
 }
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
 async function submitLocal(abs, model, token) {
   const fd = new FormData();
   fd.append("model", model);
@@ -1025,7 +1160,7 @@ async function runOcr(file, model, opts = {}) {
   const jobId = await submitJob(file, model, token);
   const deadline = started + (opts.maxWaitMs ?? 3e5);
   while (Date.now() < deadline) {
-    await sleep(opts.pollMs ?? 5e3);
+    await sleep2(opts.pollMs ?? 5e3);
     const r = await fetch(JOB_URL + "/" + jobId, { headers: { Authorization: "bearer " + token } });
     if (r.status !== 200) throw new Error("poll failed " + r.status + ": " + (await r.text()).slice(0, 200));
     const j = await r.json();
@@ -1686,8 +1821,13 @@ async function apply(ctx) {
           const q = String(args?.query ?? "").trim();
           if (!q) throw new Error("query required for search");
           const hits = search(project, q, k);
-          if (!hits.length) return "No hits for: " + q + "\nTry expand (iterative keyword mining) or add more docs.";
-          return "FTS5 hits (" + hits.length + ") for: " + q + "\n\n" + fmt(hits);
+          let acpBlock = "";
+          if (acpGraphAvailable()) {
+            const acp = acpGraphRecall(q, 3);
+            if (acp.length) acpBlock = "\n\n## ACP \u8DE8\u4F1A\u8BDD\u8BB0\u5FC6 (acp_graph)\n" + acp.map((h) => "\u2022 [" + h.node + "] " + h.summary.slice(0, 180)).join("\n");
+          }
+          if (!hits.length) return "No hits for: " + q + "\nTry expand (iterative keyword mining) or add more docs." + acpBlock;
+          return "FTS5 hits (" + hits.length + ") for: " + q + "\n\n" + fmt(hits) + acpBlock;
         }
         case "expand": {
           const q = String(args?.query ?? "").trim();

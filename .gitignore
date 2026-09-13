@@ -1,3 +1,6 @@
-.rlab/related.db
-.rlab/digests/
+# local lab data: machine state, never published
+.rlab/
+# build + deps
+node_modules/
+.test-build/
 *.bak
