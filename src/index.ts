@@ -20,6 +20,7 @@ import {
   type BenchRow, type WikiKind,
 } from './store.js';
 import { addDoc, expandSearch, hybridSearch, ingestDocDir, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
+import { acpGraphAvailable, acpGraphRecall } from './acp.js';
 import { rewriteReport } from './rewrite.js';
 import { addClaims, betaConfidence, citeClaim, claimsReport, extractClaims, loadClaims } from './extract.js';
 import { suggestExternal, suggestZh } from './suggest.js';
@@ -498,8 +499,13 @@ export async function apply(ctx: any) {
           const q = String(args?.query ?? '').trim();
           if (!q) throw new Error('query required for search');
           const hits = search(project, q, k);
-          if (!hits.length) return 'No hits for: ' + q + '\nTry expand (iterative keyword mining) or add more docs.';
-          return 'FTS5 hits (' + hits.length + ') for: ' + q + '\n\n' + fmt(hits);
+          let acpBlock = '';
+          if (acpGraphAvailable()) {
+            const acp = acpGraphRecall(q, 3);
+            if (acp.length) acpBlock = '\n\n## ACP 跨会话记忆 (acp_graph)\n' + acp.map((h) => '• [' + h.node + '] ' + h.summary.slice(0, 180)).join('\n');
+          }
+          if (!hits.length) return 'No hits for: ' + q + '\nTry expand (iterative keyword mining) or add more docs.' + acpBlock;
+          return 'FTS5 hits (' + hits.length + ') for: ' + q + '\n\n' + fmt(hits) + acpBlock;
         }
         case 'expand': {
           const q = String(args?.query ?? '').trim();

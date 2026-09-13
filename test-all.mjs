@@ -321,17 +321,33 @@ function hybridSearch(project, query, k = 10) {
 }
 function addDoc(project, title, body, source) {
   const db = openDb(project);
-  const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(title, ftsText(title + " " + body), source);
+  const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
+  const safeBody = typeof body === "string" ? body : "";
+  const safeSource = typeof source === "string" ? source : "";
+  const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(safeTitle, ftsText(safeTitle + " " + safeBody), safeSource);
   mineKeywords(project, 40);
   return Number(r.lastInsertRowid);
 }
 function ingestDocDir(project, dir, maxFiles = 200) {
   const root = path.resolve(dir);
   if (!fs.existsSync(root)) return { added: 0, skipped: 0 };
+  let isDirectory = false;
+  try {
+    isDirectory = fs.statSync(root).isDirectory();
+  } catch {
+    isDirectory = false;
+  }
+  if (!isDirectory) return { added: 0, skipped: 0 };
   let added = 0, skipped = 0;
   const walk = (d, depth) => {
     if (depth > 4 || added >= maxFiles) return;
-    for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const f of entries) {
       if (f.name.startsWith(".")) continue;
       const full = path.join(d, f.name);
       if (f.isDirectory()) {
@@ -682,16 +698,42 @@ function ensureDir(p) {
   fs3.mkdirSync(p, { recursive: true });
 }
 var WIKI_DIR = "wiki";
+function parseFrontmatter(text) {
+  const out = {};
+  const m = text.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!m) return out;
+  for (const line of m[1].split("\n")) {
+    const mm = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!mm) continue;
+    const key = mm[1];
+    const val = mm[2].trim();
+    if (val.startsWith("[") && val.endsWith("]")) {
+      out[key] = val.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
+}
 function wikiPath(project, kind, id) {
   const safe = id.replace(/[^A-Za-z0-9_.-]/g, "_");
   return path3.join(rlabDir(project), WIKI_DIR, kind, safe + ".md");
 }
 function writeWikiPage(project, page) {
   const p = wikiPath(project, page.kind, page.id);
+  const fm = [
+    "---",
+    "id: " + page.id,
+    "kind: " + page.kind,
+    "title: " + page.title.replace(/\n/g, " "),
+    "updated: " + page.updated,
+    page.tags?.length ? "tags: [" + page.tags.join(", ") + "]" : "tags: []",
+    "---",
+    ""
+  ].join("\n");
   const body = [
+    fm,
     "# " + page.title,
-    "",
-    "kind: " + page.kind + "  |  id: " + page.id + "  |  updated: " + page.updated + (page.tags?.length ? "  |  tags: " + page.tags.join(", ") : ""),
     "",
     page.content.trim(),
     ""
@@ -714,9 +756,10 @@ function listWiki(project) {
       if (!f.endsWith(".md")) continue;
       const full = path3.join(dir, f);
       const text = fs3.readFileSync(full, "utf8");
-      const title = (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, "");
-      const updated = (text.match(/updated: ([^|]+)/) || [])[1]?.trim() || "";
-      const tags = (text.match(/tags: (.+)/) || [])[1]?.split(",").map((s) => s.trim()).filter(Boolean) || [];
+      const fm = parseFrontmatter(text);
+      const title = String(fm.title || (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, ""));
+      const updated = String(fm.updated || "");
+      const tags = Array.isArray(fm.tags) ? fm.tags : fm.tags ? [String(fm.tags)] : [];
       pages.push({ kind, id: f.replace(/\.md$/, ""), title, updated, tags, content: "" });
     }
   }
@@ -903,6 +946,7 @@ export {
   loadClaims,
   mineKeywords,
   openDb,
+  parseFrontmatter,
   readBench,
   rebuildWikiIndex,
   rewriteReport,

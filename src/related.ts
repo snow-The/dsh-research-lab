@@ -187,8 +187,16 @@ export function hybridSearch(project: string, query: string, k = 10): RelatedDoc
 
 export function addDoc(project: string, title: string, body: string, source: string): number {
   const db = openDb(project);
+  // Values arrive from tools, from directory ingest and from tests. An omitted field used
+  // to reach SQLite as `undefined` ("Provided value cannot be bound to SQLite parameter 1")
+  // and a null title tripped the NOT NULL constraint - the same undefined-binding defect
+  // class that silently killed auto-capture elsewhere in this stack. Normalise, and never
+  // store an empty title (an untitled document is still a document).
+  const safeTitle = typeof title === 'string' && title.trim().length > 0 ? title : '(untitled)';
+  const safeBody = typeof body === 'string' ? body : '';
+  const safeSource = typeof source === 'string' ? source : '';
   const r = db.prepare('INSERT INTO docs(title, body, source) VALUES (?,?,?)')
-    .run(title, ftsText(title + ' ' + body), source);
+    .run(safeTitle, ftsText(safeTitle + ' ' + safeBody), safeSource);
   mineKeywords(project, 40); // refresh lexicon incrementally
   return Number(r.lastInsertRowid);
 }
@@ -198,10 +206,19 @@ export function addDoc(project: string, title: string, body: string, source: str
 export function ingestDocDir(project: string, dir: string, maxFiles = 200): { added: number; skipped: number } {
   const root = path.resolve(dir);
   if (!fs.existsSync(root)) return { added: 0, skipped: 0 };
+  // A FILE where a directory is expected (or a path that vanished between the existsSync
+  // and the stat) used to throw ENOTDIR straight out of the tool. Report a shaped result.
+  let isDirectory = false;
+  try { isDirectory = fs.statSync(root).isDirectory(); } catch { isDirectory = false; }
+  if (!isDirectory) return { added: 0, skipped: 0 };
   let added = 0, skipped = 0;
   const walk = (d: string, depth: number) => {
     if (depth > 4 || added >= maxFiles) return;
-    for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+    let entries: fs.Dirent[] = [];
+    // Unreadable or concurrently removed directories end this branch, they do not abort
+    // the whole ingest.
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const f of entries) {
       if (f.name.startsWith('.')) continue;
       const full = path.join(d, f.name);
       if (f.isDirectory()) { walk(full, depth + 1); continue; }
