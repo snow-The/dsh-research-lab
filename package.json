@@ -1,6 +1,6 @@
 {
   "name": "@snow-the/dsh-research-lab",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Research lab for DeepSeek Harness: AutoSci-style wiki (experiments/literature/decisions), ASI-Bench-grade eval rigor ledger, arXiv digest, adversarial paper review, and academic writing checks.",
   "type": "module",
   "main": "./dist/index.js",

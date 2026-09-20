@@ -5,3 +5,4 @@ export * from './suggest.js';
 export * from './arxiv.js';
 export * from './store.js';
 export * from './ref.js';
+export * from './scoop.js';

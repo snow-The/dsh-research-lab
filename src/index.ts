@@ -22,6 +22,7 @@ import {
 import { addDoc, expandSearch, hybridSearch, ingestDocDir, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
 import { acpGraphAvailable, acpGraphRecall } from './acp.js';
 import { rewriteReport } from './rewrite.js';
+import { renderScoop, scoopSlug, type ScoopArgs } from './scoop.js';
 import { addClaims, betaConfidence, citeClaim, claimsReport, extractClaims, loadClaims } from './extract.js';
 import { suggestExternal, suggestZh } from './suggest.js';
 import { cloneAndStudy } from './ref.js';
@@ -183,6 +184,50 @@ export async function apply(ctx: any) {
       const p = writeWikiPage(project, { kind: 'experiment', id, title: id + ' — ' + verdict, updated: today(), content: body });
       const idx = rebuildWikiIndex(project);
       return 'Wrote ' + p + '\nIndex: ' + idx;
+    },
+  }));
+
+  // ---------------- rlab_scoop ----------------
+  ctx.tools.register(defineTool({
+    name: 'rlab_scoop',
+    description: 'Novelty audit for a claim: FOUR axes (problem framing / core mechanism / key insight / application domain), THREE complementary query families (original-problem / broad-domain / method-signature), a 0-4 axis-overlap score, and the 7-step Scoop-Check flow — written as a wiki page in which every step the caller did NOT supply is printed as 未做, so an incomplete audit cannot be mistaken for “looked and found nothing”. Structure adapted from microsoft/ResearchStudio-Idea (arXiv 2607.04439, MIT). Retrieval is NOT done here: run search_open / search_arxiv and pass the hits in.',
+    parameters: {
+      project: { type: 'string', required: true, description: 'absolute path to the research project root' },
+      claim: { type: 'string', required: true, description: 'the novelty claim to test, in one sentence' },
+      id: { type: 'string', description: 'short kebab id (default: derived from the claim)' },
+      axes: { type: 'string', description: 'JSON: {"problem":"...","mechanism":"...","insight":"...","domain":"..."}' },
+      queries: { type: 'string', description: 'JSON array: [{"family":"original-problem|broad-domain|method-signature","query":"...","hits":[{"title":"...","url":"...","detail":"..."}]}]' },
+      candidates: { type: 'string', description: 'JSON array: [{"title":"...","overlap":0-4,"notes":"..."}]' },
+      verdict: { type: 'string', description: 'novel | collides | unclear (omit = 未判定, and the page says so)' },
+      delta: { type: 'string', description: 'the crisp, defensible delta statement vs the closest prior art' },
+      notes: { type: 'string', description: 'free notes appended to the page' },
+    },
+    output: textOut,
+    timeoutMs: 15000,
+    async execute(args: any) {
+      const project = String(args?.project ?? '').trim();
+      const claim = String(args?.claim ?? '').trim();
+      if (!project || !claim) throw new Error('project and claim required');
+      const parse = (v: unknown): unknown => {
+        if (v == null || v === '') return undefined;
+        if (typeof v !== 'string') return v;
+        try { return JSON.parse(v); } catch (e) { throw new Error('not valid JSON: ' + String((e as Error).message).slice(0, 90)); }
+      };
+      const verdict = String(args?.verdict ?? '').trim();
+      if (verdict && !['novel', 'collides', 'unclear'].includes(verdict)) throw new Error('verdict must be novel|collides|unclear');
+      const raw = String(args?.id ?? '').trim() || scoopSlug(claim);
+      const id = raw.startsWith('scoop-') ? raw : 'scoop-' + raw;
+      const body = renderScoop({
+        claim,
+        axes: parse(args?.axes) as ScoopArgs["axes"],
+        queries: parse(args?.queries) as ScoopArgs["queries"],
+        candidates: parse(args?.candidates) as ScoopArgs["candidates"],
+        verdict: (verdict || undefined) as ScoopArgs['verdict'],
+        delta: args?.delta, notes: args?.notes,
+      });
+      const p = writeWikiPage(project, { kind: 'experiment', id, title: 'Scoop check — ' + (verdict || '未判定') + ' — ' + claim.slice(0, 60), updated: today(), content: body });
+      const idx = rebuildWikiIndex(project);
+      return 'Wrote ' + p + '\nIndex: ' + idx + '\n\n' + body.split('\n').slice(0, 10).join('\n');
     },
   }));
 

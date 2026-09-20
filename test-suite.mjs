@@ -54,5 +54,29 @@ try {
   ok('wikipedia suggestions (may be offline)', s.length > 0, s.map(x => x.term).join(','));
 } catch (e) { ok('wikipedia suggestions', false, String(e)); }
 
+console.log('== 5. rlab_scoop: the novelty audit keeps its gaps visible ==');
+const filled = rel.renderScoop({
+  claim: 'Fold old context at the hard limit instead of the soft limit',
+  axes: { problem: 'when to compact', mechanism: 'host-triggered fold', insight: 'cache invalidation dominates', domain: 'coding agents' },
+  queries: [
+    { family: 'original-problem', query: 'when to compact agent context', hits: [{ title: 'Compaction Provenance', url: 'https://example.org/a' }] },
+    { family: 'broad-domain', query: 'agent memory management', hits: [] },
+  ],
+  candidates: [{ title: 'A folding policy', overlap: 3, notes: 'mechanism matches, domain differs' }],
+  verdict: 'novel',
+  delta: 'trigger placement, not the summary',
+});
+ok('filled audit says how complete it is', /四轴 4\/4 · 查询族 2\/3 · 候选 1 篇/.test(filled), (filled.split('\n')[5] || '').slice(0, 80));
+ok('the missing query family is printed as 未做, not omitted', /Method-Signature[\s\S]{0,80}未做/.test(filled));
+ok('an overlap>=3 candidate is called out for the deep dive', /机制层面像的[^\n]*A folding policy/.test(filled));
+ok('the method is attributed', /arXiv 2607\.04439/.test(filled) && /ResearchStudio-Idea/.test(filled));
+
+const bare = rel.renderScoop({ claim: '一个中文主张，用来验证 slug 回退与缺口提示' });
+ok('an empty audit prints a GAP warning', /这份审计并不完整/.test(bare));
+ok('unfilled axes are marked 未填', /—（未填）/.test(bare));
+ok('every step is still listed (nothing silently skipped)', ['Step 1', 'Step 2', 'Step 3-4', 'Step 5-7'].every(s => bare.includes(s)));
+ok('slug falls back to a hash for pure-CJK claims', /^scoop-[0-9a-f]{4,8}$/.test(rel.scoopSlug('一个中文主张')));
+ok('slug is deterministic', rel.scoopSlug('Fold at the hard limit') === rel.scoopSlug('Fold at the hard limit'));
+
 console.log('\n===== RESULT: ' + pass + ' passed / ' + fail + ' failed =====');
 process.exit(fail ? 1 : 0);

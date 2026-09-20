@@ -842,6 +842,104 @@ function rewriteReport(text) {
   return lines.join("\n");
 }
 
+// src/scoop.ts
+var AXES = [
+  ["problem", "Problem framing \u2014 \u63D0\u51FA\u7684\u95EE\u9898\u662F\u4EC0\u4E48"],
+  ["mechanism", "Core mechanism \u2014 \u771F\u6B63\u505A\u529F\u7684\u6280\u672F\u52A8\u4F5C"],
+  ["insight", "Key insight \u2014 \u4E3A\u4EC0\u4E48\u5B83\u5E94\u8BE5\u6210\u7ACB"],
+  ["domain", "Application domain \u2014 \u7528\u5728\u54EA\u91CC"]
+];
+var FAMILIES = [
+  ["original-problem", "Original-Problem \u2014 \u590D\u8FF0\u539F\u59CB\u7814\u7A76\u95EE\u9898"],
+  ["broad-domain", "Broad-Domain \u2014 \u9AD8\u5C42\u9886\u57DF\uFF083-5 \u8BCD\uFF09"],
+  ["method-signature", "Method-Signature \u2014 \u5177\u4F53\u6280\u672F\u52A8\u4F5C\uFF085-8 \u8BCD\uFF09"]
+];
+var DASH = "\u2014\uFF08\u672A\u586B\uFF09";
+var NOT_DONE = "\u672A\u505A";
+function scoopSlug(claim) {
+  const ascii = String(claim ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  if (ascii.length >= 8) return ascii;
+  let h = 5381;
+  for (const ch of String(claim ?? "")) {
+    h = h * 33 ^ (ch.codePointAt(0) ?? 0);
+    h = h >>> 0;
+  }
+  return "scoop-" + h.toString(16).slice(0, 8);
+}
+function renderScoop(a) {
+  const axes = a.axes ?? {};
+  const filled = AXES.filter(([k]) => String(axes[k] ?? "").trim() !== "");
+  const queries = Array.isArray(a.queries) ? a.queries : [];
+  const doneFamilies = FAMILIES.filter(([f]) => queries.some((q) => q != null && q.family === f));
+  const candidates = Array.isArray(a.candidates) ? a.candidates : [];
+  const deep = candidates.filter((c) => c != null && typeof c.overlap === "number" && c.overlap >= 3);
+  const L = [];
+  const push = (...xs) => {
+    for (const x of xs) L.push(x);
+  };
+  push("## 0. \u5224\u5B9A\u6458\u8981", "");
+  push("- **\u4E3B\u5F20**\uFF1A" + (a.claim || DASH));
+  push("- **\u5224\u5B9A**\uFF1A" + (a.verdict ?? "\u672A\u5224\u5B9A"));
+  push("- **delta**\uFF1A" + (String(a.delta ?? "").trim() || DASH));
+  push("- **\u8BC1\u636E\u5B8C\u5907\u5EA6**\uFF1A\u56DB\u8F74 " + filled.length + "/4 \xB7 \u67E5\u8BE2\u65CF " + doneFamilies.length + "/3 \xB7 \u5019\u9009 " + candidates.length + " \u7BC7 \xB7 \u673A\u5236\u91CD\u53E0\u22653 \u7684 " + deep.length + " \u7BC7");
+  if (filled.length < 4 || doneFamilies.length < 3 || candidates.length === 0) {
+    push("- **\u7F3A\u53E3**\uFF1A\u8FD9\u4EFD\u5BA1\u8BA1\u5E76\u4E0D\u5B8C\u6574 \u2014\u2014 \u4E0B\u9762\u6807 " + NOT_DONE + " \u7684\u6B65\u9AA4\u4E0D\u80FD\u8BFB\u6210\u201C\u67E5\u8FC7\u4E86\u3001\u6CA1\u6709\u201D\u3002");
+  }
+  push("");
+  push("## 1. \u4E3B\u5F20\uFF08\u8981\u68C0\u9A8C\u7684\u65B0\u9896\u6027\uFF09", "", a.claim || DASH, "");
+  push("## 2. Step 1 \u2014 \u56DB\u8F74\u5206\u89E3", "");
+  push("| \u8F74 | \u5185\u5BB9 |", "| :--- | :--- |");
+  for (const [k, label] of AXES) {
+    const v = String(axes[k] ?? "").trim();
+    push("| " + label + " | " + (v || DASH) + " |");
+  }
+  push("", filled.length === 4 ? "\u56DB\u8F74\u9F50\u5907\u3002" : "\u56DB\u8F74\u53EA\u586B\u4E86 " + filled.length + "/4 \u2014\u2014 \u7A7A\u8F74\u4F1A\u8BA9\u91CD\u53E0\u8BC4\u5206\u5931\u53BB\u610F\u4E49\u3002", "");
+  push("## 3. Step 2 \u2014 \u4E09\u4E2A\u4E92\u8865\u67E5\u8BE2\u4E0E\u8BC1\u636E", "");
+  for (const [f, label] of FAMILIES) {
+    const qs = queries.filter((q) => q != null && q.family === f);
+    push("### " + label, "");
+    if (qs.length === 0) {
+      push(NOT_DONE + "\uFF08\u8FD9\u4E00\u65CF\u6CA1\u6709\u67E5\u8BE2\u8BB0\u5F55\uFF09", "");
+      continue;
+    }
+    for (const q of qs) {
+      push("- \u67E5\u8BE2\uFF1A`" + String(q?.query ?? "") + "`");
+      const hits = Array.isArray(q?.hits) ? q.hits : [];
+      if (hits.length === 0) {
+        push("  - \u65E0\u547D\u4E2D");
+        continue;
+      }
+      for (const h of hits.slice(0, 12)) {
+        push("  - " + (h?.title ?? "") + (h?.url ? " \u2014 " + h.url : "") + (h?.detail ? "  _" + h.detail + "_" : ""));
+      }
+    }
+    push("");
+  }
+  push("## 4. Step 3-4 \u2014 \u5019\u9009\u4E0E\u91CD\u53E0\u8BC4\u5206\uFF080-4 = \u547D\u4E2D\u51E0\u8F74\uFF09", "");
+  if (candidates.length === 0) {
+    push(NOT_DONE + "\uFF08\u6CA1\u6709\u5019\u9009\u8BB0\u5F55\uFF09", "");
+  } else {
+    push("| \u5019\u9009 | \u91CD\u53E0 | \u5907\u6CE8 |", "| :--- | ---: | :--- |");
+    for (const c of candidates) {
+      const o = c != null && typeof c.overlap === "number" ? String(c.overlap) : "?";
+      push("| " + (c?.title ?? "") + " | " + o + " | " + (c?.notes ?? "") + " |");
+    }
+    push("", "\u91CD\u53E0\u22653\uFF08\u673A\u5236\u5C42\u9762\u50CF\u7684\uFF09\u5E94\u8FDB\u5165\u5168\u6587\u6DF1\u8BFB\uFF1A" + (deep.length ? deep.map((c) => c.title).join("\u3001") : "\u65E0"), "");
+  }
+  push("## 5. Step 5-7 \u2014 \u6DF1\u8BFB\u3001\u6BD4\u8F83\u3001delta", "");
+  const deepNotes = candidates.some((c) => String(c?.notes ?? "").trim() !== "");
+  push("- Step 5 \u5168\u6587\u6DF1\u8BFB\uFF1A" + (deepNotes ? "\u6709\u8BB0\u5F55\uFF08\u89C1\u8868\u5185\u5907\u6CE8\uFF09" : NOT_DONE));
+  push("- Step 6 \u4E0E\u4E3B\u5F20\u6BD4\u8F83\uFF1A" + (a.verdict ? "\u505A\u4E86\uFF0C\u5224\u5B9A " + a.verdict : NOT_DONE));
+  push("- Step 7 delta \u9648\u8FF0\uFF1A" + (String(a.delta ?? "").trim() ? "\u89C1 \xA70" : NOT_DONE));
+  if (String(a.notes ?? "").trim()) push("", "\u8865\u5145\uFF1A" + String(a.notes));
+  push("");
+  push("## 6. \u65B9\u6CD5\u51FA\u5904", "");
+  push("\u4E03\u6B65\u6D41\u7A0B / \u56DB\u8F74 / \u4E09\u67E5\u8BE2 / 0-4 \u91CD\u53E0\u8BC4\u5206 \u53D6\u81EA microsoft/ResearchStudio-Idea \u7684 `scoop_check` skill");
+  push("\uFF08[arXiv 2607.04439](https://arxiv.org/abs/2607.04439)\uFF0CMIT\uFF09\u3002\u672C\u9875\u7531 `rlab_scoop` \u751F\u6210\uFF1A\u5B83\u53EA\u8D1F\u8D23");
+  push("**\u7ED3\u6784\u4E0E\u8BC1\u636E\u7559\u75D5**\uFF1B\u68C0\u7D22\u7531 dsh-search \u7684 `search_open` / `search_arxiv` \u5B8C\u6210\uFF08\u5404\u53F8\u5176\u804C\uFF09\u3002");
+  return L.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
 // src/extract.ts
 import * as fs3 from "node:fs";
 import * as path3 from "node:path";
@@ -1520,6 +1618,53 @@ async function apply(ctx) {
       const p = writeWikiPage(project, { kind: "experiment", id, title: id + " \u2014 " + verdict, updated: today(), content: body });
       const idx = rebuildWikiIndex(project);
       return "Wrote " + p + "\nIndex: " + idx;
+    }
+  }));
+  ctx.tools.register(defineTool({
+    name: "rlab_scoop",
+    description: "Novelty audit for a claim: FOUR axes (problem framing / core mechanism / key insight / application domain), THREE complementary query families (original-problem / broad-domain / method-signature), a 0-4 axis-overlap score, and the 7-step Scoop-Check flow \u2014 written as a wiki page in which every step the caller did NOT supply is printed as \u672A\u505A, so an incomplete audit cannot be mistaken for \u201Clooked and found nothing\u201D. Structure adapted from microsoft/ResearchStudio-Idea (arXiv 2607.04439, MIT). Retrieval is NOT done here: run search_open / search_arxiv and pass the hits in.",
+    parameters: {
+      project: { type: "string", required: true, description: "absolute path to the research project root" },
+      claim: { type: "string", required: true, description: "the novelty claim to test, in one sentence" },
+      id: { type: "string", description: "short kebab id (default: derived from the claim)" },
+      axes: { type: "string", description: 'JSON: {"problem":"...","mechanism":"...","insight":"...","domain":"..."}' },
+      queries: { type: "string", description: 'JSON array: [{"family":"original-problem|broad-domain|method-signature","query":"...","hits":[{"title":"...","url":"...","detail":"..."}]}]' },
+      candidates: { type: "string", description: 'JSON array: [{"title":"...","overlap":0-4,"notes":"..."}]' },
+      verdict: { type: "string", description: "novel | collides | unclear (omit = \u672A\u5224\u5B9A, and the page says so)" },
+      delta: { type: "string", description: "the crisp, defensible delta statement vs the closest prior art" },
+      notes: { type: "string", description: "free notes appended to the page" }
+    },
+    output: textOut,
+    timeoutMs: 15e3,
+    async execute(args) {
+      const project = String(args?.project ?? "").trim();
+      const claim = String(args?.claim ?? "").trim();
+      if (!project || !claim) throw new Error("project and claim required");
+      const parse = (v) => {
+        if (v == null || v === "") return void 0;
+        if (typeof v !== "string") return v;
+        try {
+          return JSON.parse(v);
+        } catch (e) {
+          throw new Error("not valid JSON: " + String(e.message).slice(0, 90));
+        }
+      };
+      const verdict = String(args?.verdict ?? "").trim();
+      if (verdict && !["novel", "collides", "unclear"].includes(verdict)) throw new Error("verdict must be novel|collides|unclear");
+      const raw = String(args?.id ?? "").trim() || scoopSlug(claim);
+      const id = raw.startsWith("scoop-") ? raw : "scoop-" + raw;
+      const body = renderScoop({
+        claim,
+        axes: parse(args?.axes),
+        queries: parse(args?.queries),
+        candidates: parse(args?.candidates),
+        verdict: verdict || void 0,
+        delta: args?.delta,
+        notes: args?.notes
+      });
+      const p = writeWikiPage(project, { kind: "experiment", id, title: "Scoop check \u2014 " + (verdict || "\u672A\u5224\u5B9A") + " \u2014 " + claim.slice(0, 60), updated: today(), content: body });
+      const idx = rebuildWikiIndex(project);
+      return "Wrote " + p + "\nIndex: " + idx + "\n\n" + body.split("\n").slice(0, 10).join("\n");
     }
   }));
   ctx.tools.register(defineTool({
