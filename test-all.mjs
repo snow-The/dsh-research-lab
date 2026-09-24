@@ -199,6 +199,17 @@ function openDb(project) {
     CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
       INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', old.id, old.title, old.body);
     END;
+    -- Absorb ledger. Without it rlab_absorb re-read the FIRST max files of a directory on every call:
+    -- there was no cursor, no skip and no dedupe, so a second call re-did the same work and reported
+    -- "0 skipped" every time, and the docs table gained a duplicate row per call. 'key' is the cheap
+    -- change detector (size:mtimeMs) so an unchanged file is skipped without reading it at all.
+    CREATE TABLE IF NOT EXISTS absorbed (
+      path TEXT PRIMARY KEY,
+      key TEXT NOT NULL DEFAULT '',
+      doc_id INTEGER,
+      page TEXT,
+      ts TEXT DEFAULT (date('now'))
+    );
   `);
   return db;
 }
@@ -318,6 +329,27 @@ function hybridSearch(project, query, k = 10) {
   const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([id]) => Number(id));
   const byId = new Map(rows.map((d) => [d.id, d]));
   return ranked.map((id) => byId.get(id)).filter((d) => !!d);
+}
+function absorbLedger(project) {
+  const db = openDb(project);
+  const rows = db.prepare("SELECT path, key, doc_id, page FROM absorbed").all();
+  return new Map(rows.map((r) => [r.path, r]));
+}
+function recordAbsorbed(project, row) {
+  const db = openDb(project);
+  db.prepare(`INSERT INTO absorbed(path, key, doc_id, page, ts) VALUES (?,?,?,?,date('now'))
+    ON CONFLICT(path) DO UPDATE SET key=excluded.key, doc_id=excluded.doc_id, page=excluded.page, ts=excluded.ts`).run(row.path, row.key, row.docId ?? null, row.page ?? null);
+}
+function updateDoc(project, id, title, body, source) {
+  const db = openDb(project);
+  const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
+  const before = db.prepare("SELECT title, body FROM docs WHERE id=?").get(id);
+  if (before === void 0) return false;
+  db.prepare("INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', ?, ?, ?)").run(id, before.title, before.body);
+  db.prepare("UPDATE docs SET title=?, body=?, source=?, added=date('now') WHERE id=?").run(safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")), source, id);
+  db.prepare("INSERT INTO docs_fts(rowid, title, body) VALUES (?,?,?)").run(id, safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")));
+  mineKeywords(project, 40);
+  return true;
 }
 function addDoc(project, title, body, source) {
   const db = openDb(project);
@@ -1071,6 +1103,7 @@ function renderScoop(a) {
   return L.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 export {
+  absorbLedger,
   addClaims,
   addDoc,
   appendBench,
@@ -1096,6 +1129,7 @@ export {
   parseFrontmatter,
   readBench,
   rebuildWikiIndex,
+  recordAbsorbed,
   renderScoop,
   rewriteReport,
   rewriteText,
@@ -1106,6 +1140,7 @@ export {
   suggestZh,
   tokenize,
   topKeywords,
+  updateDoc,
   wikiPath,
   writeWikiPage
 };
