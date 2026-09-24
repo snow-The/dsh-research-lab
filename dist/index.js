@@ -477,6 +477,17 @@ function openDb(project) {
     CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
       INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', old.id, old.title, old.body);
     END;
+    -- Absorb ledger. Without it rlab_absorb re-read the FIRST max files of a directory on every call:
+    -- there was no cursor, no skip and no dedupe, so a second call re-did the same work and reported
+    -- "0 skipped" every time, and the docs table gained a duplicate row per call. 'key' is the cheap
+    -- change detector (size:mtimeMs) so an unchanged file is skipped without reading it at all.
+    CREATE TABLE IF NOT EXISTS absorbed (
+      path TEXT PRIMARY KEY,
+      key TEXT NOT NULL DEFAULT '',
+      doc_id INTEGER,
+      page TEXT,
+      ts TEXT DEFAULT (date('now'))
+    );
   `);
   return db;
 }
@@ -596,6 +607,27 @@ function hybridSearch(project, query, k = 10) {
   const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([id]) => Number(id));
   const byId = new Map(rows.map((d) => [d.id, d]));
   return ranked.map((id) => byId.get(id)).filter((d) => !!d);
+}
+function absorbLedger(project) {
+  const db = openDb(project);
+  const rows = db.prepare("SELECT path, key, doc_id, page FROM absorbed").all();
+  return new Map(rows.map((r) => [r.path, r]));
+}
+function recordAbsorbed(project, row) {
+  const db = openDb(project);
+  db.prepare(`INSERT INTO absorbed(path, key, doc_id, page, ts) VALUES (?,?,?,?,date('now'))
+    ON CONFLICT(path) DO UPDATE SET key=excluded.key, doc_id=excluded.doc_id, page=excluded.page, ts=excluded.ts`).run(row.path, row.key, row.docId ?? null, row.page ?? null);
+}
+function updateDoc(project, id, title, body, source) {
+  const db = openDb(project);
+  const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
+  const before = db.prepare("SELECT title, body FROM docs WHERE id=?").get(id);
+  if (before === void 0) return false;
+  db.prepare("INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', ?, ?, ?)").run(id, before.title, before.body);
+  db.prepare("UPDATE docs SET title=?, body=?, source=?, added=date('now') WHERE id=?").run(safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")), source, id);
+  db.prepare("INSERT INTO docs_fts(rowid, title, body) VALUES (?,?,?)").run(id, safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")));
+  mineKeywords(project, 40);
+  return true;
 }
 function addDoc(project, title, body, source) {
   const db = openDb(project);
@@ -2072,12 +2104,13 @@ async function apply(ctx) {
   }));
   ctx.tools.register(defineTool({
     name: "rlab_absorb",
-    description: "Auto-absorb dsh-lib-analyzer reports into the research wiki + related.db: scans batch/out and .dsh-lib-analyzer/pages for .md reports and writes each as a wiki page (kind=experiment by default) and indexes it. The zero-friction loop: libreport sinks a knowledge page -> run this -> it becomes wiki literature/experiment pages searchable via rlab_related.",
+    description: "Absorb dsh-lib-analyzer reports into the research wiki + related.db, RESUMABLY: scans batch/out and .dsh-lib-analyzer/pages, skips every file whose size:mtime is already in the absorb ledger, and absorbs at most max files per call (newest first, inside a wall-clock budget) - call it again with the same arguments to continue where it stopped. A file that CHANGED is re-absorbed and its indexed document is updated in place instead of being added a second time. The zero-friction loop: libreport sinks a knowledge page -> run this -> it becomes a wiki page searchable via rlab_related.",
     parameters: {
       project: { type: "string", required: true, description: "absolute path to the research project root" },
       dir: { type: "string", description: "directory to scan (default: auto-detect batch/out + .dsh-lib-analyzer/pages)" },
       kind: { type: "string", description: "wiki kind: experiment (default) | literature | decision" },
-      max: { type: "number", description: "max reports to absorb (default 50)" }
+      max: { type: "number", description: "max reports to absorb in THIS call (default 50); the rest stay pending for the next call" },
+      budgetMs: { type: "number", description: "wall-clock budget for one call (default 8000) - the loop yields between files and stops at the budget, so a large backlog can never block the host" }
     },
     output: textOut,
     timeoutMs: 6e4,
@@ -2086,36 +2119,67 @@ async function apply(ctx) {
       if (!project) throw new Error("project required");
       const kind = String(args?.kind ?? "experiment").trim();
       if (!["experiment", "literature", "decision"].includes(kind)) throw new Error("kind must be experiment|literature|decision");
-      const max = Number(args?.max) || 50;
+      const max = Math.max(1, Number(args?.max) || 50);
+      const budgetMs = Math.max(200, Number(args?.budgetMs) || 8e3);
       const dirs = String(args?.dir ?? "").trim() ? [String(args?.dir).trim()] : [path7.join(project, "batch", "out"), path7.join(project, ".dsh-lib-analyzer", "pages")];
-      let written = 0, indexed = 0, skipped = 0;
-      const files = [];
+      const seen = /* @__PURE__ */ new Map();
       for (const d of dirs) {
         if (!fs7.existsSync(d)) continue;
-        const walk = (p) => {
-          for (const f of fs7.readdirSync(p, { withFileTypes: true })) {
+        const walk = (p, depth) => {
+          if (depth > 4) return;
+          let entries = [];
+          try {
+            entries = fs7.readdirSync(p, { withFileTypes: true });
+          } catch {
+            return;
+          }
+          for (const f of entries) {
             if (f.name.startsWith(".")) continue;
             const full = path7.join(p, f.name);
-            if (f.isDirectory()) walk(full);
-            else if (f.name.endsWith(".md") && files.length < max) files.push(full);
+            if (f.isDirectory()) {
+              walk(full, depth + 1);
+              continue;
+            }
+            if (!f.name.endsWith(".md")) continue;
+            let st;
+            try {
+              st = fs7.statSync(full);
+            } catch {
+              continue;
+            }
+            const rel = path7.relative(project, full).replace(/\\/g, "/");
+            seen.set(rel, { full, rel, key: st.size + ":" + Math.round(st.mtimeMs), mtimeMs: st.mtimeMs });
           }
         };
-        walk(d);
+        walk(d, 0);
       }
-      for (const f of files) {
+      const ledger = absorbLedger(project);
+      const pending = [...seen.values()].filter((f) => ledger.get(f.rel)?.key !== f.key).sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const unchanged = seen.size - pending.length;
+      const started = Date.now();
+      let absorbed = 0, failed = 0, updatedInPlace = 0;
+      for (const f of pending) {
+        if (absorbed + failed >= max) break;
+        if (Date.now() - started > budgetMs) break;
         try {
-          const text = fs7.readFileSync(f, "utf8").slice(0, 2e4);
-          const rel = path7.relative(project, f).replace(/\\/g, "/");
-          const slug = path7.basename(f, ".md").replace(/[^\w\u4e00-\u9fff-]+/g, "-").slice(0, 60) || "report";
-          writeWikiPage(project, { kind, id: slug, title: slug + " (absorbed)", updated: today(), content: text.slice(0, 5e3) + "\n\n---\nSource: " + rel, tags: ["absorb", path7.basename(path7.dirname(f))] });
-          addDoc(project, rel, text, "absorb");
-          written++;
-          indexed++;
+          const text = fs7.readFileSync(f.full, "utf8").slice(0, 2e4);
+          const slug = path7.basename(f.full, ".md").replace(/[^\w\u4e00-\u9fff-]+/g, "-").slice(0, 60) || "report";
+          const page = writeWikiPage(project, { kind, id: slug, title: slug + " (absorbed)", updated: today(), content: text.slice(0, 5e3) + "\n\n---\nSource: " + f.rel, tags: ["absorb", path7.basename(path7.dirname(f.full))] });
+          const before = ledger.get(f.rel);
+          let docId = null;
+          if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, "absorb")) {
+            docId = before.doc_id;
+            updatedInPlace++;
+          } else docId = addDoc(project, f.rel, text, "absorb");
+          recordAbsorbed(project, { path: f.rel, key: f.key, docId, page });
+          absorbed++;
         } catch {
-          skipped++;
+          failed++;
         }
+        await new Promise((r) => setImmediate(r));
       }
-      return "Absorbed " + written + " reports (" + files.length + " found, " + skipped + " skipped) from: " + (dirs.filter((d) => fs7.existsSync(d)).join(", ") || "(no dirs)") + "\nwiki pages: " + written + " | related.db docs: " + indexed;
+      const remaining = Math.max(0, pending.length - absorbed - failed);
+      return "Absorbed " + absorbed + " report(s) \u2014 " + seen.size + " found, " + unchanged + " unchanged since the last run, " + failed + " failed" + (updatedInPlace > 0 ? ", " + updatedInPlace + " re-indexed in place (the file changed)" : "") + "\nfrom: " + (dirs.filter((d) => fs7.existsSync(d)).join(", ") || "(no dirs)") + "\nwiki pages: " + absorbed + " | related.db docs: " + absorbed + (remaining > 0 ? "\n" + remaining + " still pending \u2014 call again with the same arguments; the ledger skips everything already done." : "\nNothing left to absorb in those directories.");
     }
   }));
   ctx.tools.register(defineTool({

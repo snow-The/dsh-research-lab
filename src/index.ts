@@ -19,7 +19,7 @@ import {
   appendBench, benchReport, listWiki, readBench, rebuildWikiIndex, rlabDir, writeWikiPage,
   type BenchRow, type WikiKind,
 } from './store.js';
-import { addDoc, expandSearch, hybridSearch, ingestDocDir, mineKeywords, openDb, search, topKeywords, type RelatedDoc } from './related.js';
+import { absorbLedger, addDoc, expandSearch, hybridSearch, ingestDocDir, mineKeywords, openDb, recordAbsorbed, search, topKeywords, updateDoc, type RelatedDoc } from './related.js';
 import { acpGraphAvailable, acpGraphRecall } from './acp.js';
 import { rewriteReport } from './rewrite.js';
 import { renderScoop, scoopSlug, type ScoopArgs } from './scoop.js';
@@ -648,12 +648,13 @@ export async function apply(ctx: any) {
   // ---------------- rlab_absorb: lib-analyzer reports -> wiki pages ----------------
   ctx.tools.register(defineTool({
     name: 'rlab_absorb',
-    description: 'Auto-absorb dsh-lib-analyzer reports into the research wiki + related.db: scans batch/out and .dsh-lib-analyzer/pages for .md reports and writes each as a wiki page (kind=experiment by default) and indexes it. The zero-friction loop: libreport sinks a knowledge page -> run this -> it becomes wiki literature/experiment pages searchable via rlab_related.',
+    description: 'Absorb dsh-lib-analyzer reports into the research wiki + related.db, RESUMABLY: scans batch/out and .dsh-lib-analyzer/pages, skips every file whose size:mtime is already in the absorb ledger, and absorbs at most max files per call (newest first, inside a wall-clock budget) - call it again with the same arguments to continue where it stopped. A file that CHANGED is re-absorbed and its indexed document is updated in place instead of being added a second time. The zero-friction loop: libreport sinks a knowledge page -> run this -> it becomes a wiki page searchable via rlab_related.',
     parameters: {
       project: { type: 'string', required: true, description: 'absolute path to the research project root' },
       dir: { type: 'string', description: 'directory to scan (default: auto-detect batch/out + .dsh-lib-analyzer/pages)' },
       kind: { type: 'string', description: 'wiki kind: experiment (default) | literature | decision' },
-      max: { type: 'number', description: 'max reports to absorb (default 50)' },
+      max: { type: 'number', description: 'max reports to absorb in THIS call (default 50); the rest stay pending for the next call' },
+      budgetMs: { type: 'number', description: 'wall-clock budget for one call (default 8000) - the loop yields between files and stops at the budget, so a large backlog can never block the host' },
     },
     output: textOut,
     timeoutMs: 60000,
@@ -662,35 +663,72 @@ export async function apply(ctx: any) {
       if (!project) throw new Error('project required');
       const kind = String(args?.kind ?? 'experiment').trim();
       if (!['experiment', 'literature', 'decision'].includes(kind)) throw new Error('kind must be experiment|literature|decision');
-      const max = Number(args?.max) || 50;
+      const max = Math.max(1, Number(args?.max) || 50);
+      const budgetMs = Math.max(200, Number(args?.budgetMs) || 8000);
       const dirs = String(args?.dir ?? '').trim()
         ? [String(args?.dir).trim()]
         : [path.join(project, 'batch', 'out'), path.join(project, '.dsh-lib-analyzer', 'pages')];
-      let written = 0, indexed = 0, skipped = 0;
-      const files: string[] = [];
+
+      // 1. Collect with a CHEAP change key (size:mtimeMs) — an unchanged file is decided without a read.
+      const seen = new Map<string, { full: string; rel: string; key: string; mtimeMs: number }>();
       for (const d of dirs) {
         if (!fs.existsSync(d)) continue;
-        const walk = (p: string) => {
-          for (const f of fs.readdirSync(p, { withFileTypes: true })) {
+        const walk = (p: string, depth: number) => {
+          if (depth > 4) return;
+          let entries: fs.Dirent[] = [];
+          try { entries = fs.readdirSync(p, { withFileTypes: true }); } catch { return; }
+          for (const f of entries) {
             if (f.name.startsWith('.')) continue;
             const full = path.join(p, f.name);
-            if (f.isDirectory()) walk(full);
-            else if (f.name.endsWith('.md') && files.length < max) files.push(full);
+            if (f.isDirectory()) { walk(full, depth + 1); continue; }
+            if (!f.name.endsWith('.md')) continue;
+            let st: fs.Stats;
+            try { st = fs.statSync(full); } catch { continue; }
+            const rel = path.relative(project, full).replace(/\\/g, '/');
+            seen.set(rel, { full, rel, key: st.size + ':' + Math.round(st.mtimeMs), mtimeMs: st.mtimeMs });
           }
         };
-        walk(d);
+        walk(d, 0);
       }
-      for (const f of files) {
+
+      // 2. The LEDGER decides what is left — the resume cursor this tool never had. Newest first, so a
+      //    report written a minute ago never queues behind a year-old backlog.
+      const ledger = absorbLedger(project);
+      const pending = [...seen.values()]
+        .filter((f) => ledger.get(f.rel)?.key !== f.key)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const unchanged = seen.size - pending.length;
+
+      // 3. Absorb at most max inside a wall-clock budget, yielding between files: a 200-file call used to
+      //    run the whole loop synchronously and take the host down with it.
+      const started = Date.now();
+      let absorbed = 0, failed = 0, updatedInPlace = 0;
+      for (const f of pending) {
+        if (absorbed + failed >= max) break;
+        if (Date.now() - started > budgetMs) break;
         try {
-          const text = fs.readFileSync(f, 'utf8').slice(0, 20000);
-          const rel = path.relative(project, f).replace(/\\/g, '/');
-          const slug = path.basename(f, '.md').replace(/[^\w\u4e00-\u9fff-]+/g, '-').slice(0, 60) || 'report';
-          writeWikiPage(project, { kind: kind as any, id: slug, title: slug + ' (absorbed)', updated: today(), content: text.slice(0, 5000) + '\n\n---\nSource: ' + rel, tags: ['absorb', path.basename(path.dirname(f))] });
-          addDoc(project, rel, text, 'absorb');
-          written++; indexed++;
-        } catch { skipped++; }
+          const text = fs.readFileSync(f.full, 'utf8').slice(0, 20000);
+          const slug = path.basename(f.full, '.md').replace(/[^\w\u4e00-\u9fff-]+/g, '-').slice(0, 60) || 'report';
+          const page = writeWikiPage(project, { kind: kind as any, id: slug, title: slug + ' (absorbed)', updated: today(), content: text.slice(0, 5000) + '\n\n---\nSource: ' + f.rel, tags: ['absorb', path.basename(path.dirname(f.full))] });
+          const before = ledger.get(f.rel);
+          let docId: number | null = null;
+          if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, 'absorb')) { docId = before.doc_id; updatedInPlace++; }
+          else docId = addDoc(project, f.rel, text, 'absorb');
+          recordAbsorbed(project, { path: f.rel, key: f.key, docId, page });
+          absorbed++;
+        } catch { failed++; }
+        await new Promise((r) => setImmediate(r));   // let the host breathe between files
       }
-      return 'Absorbed ' + written + ' reports (' + files.length + ' found, ' + skipped + ' skipped) from: ' + (dirs.filter(d => fs.existsSync(d)).join(', ') || '(no dirs)') + '\nwiki pages: ' + written + ' | related.db docs: ' + indexed;
+
+      const remaining = Math.max(0, pending.length - absorbed - failed);
+      return 'Absorbed ' + absorbed + ' report(s) — ' + seen.size + ' found, ' + unchanged + ' unchanged since the last run, '
+        + failed + ' failed'
+        + (updatedInPlace > 0 ? ', ' + updatedInPlace + ' re-indexed in place (the file changed)' : '')
+        + '\nfrom: ' + (dirs.filter(d => fs.existsSync(d)).join(', ') || '(no dirs)')
+        + '\nwiki pages: ' + absorbed + ' | related.db docs: ' + absorbed
+        + (remaining > 0
+          ? '\n' + remaining + ' still pending — call again with the same arguments; the ledger skips everything already done.'
+          : '\nNothing left to absorb in those directories.');
     },
   }));
 

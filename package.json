@@ -1,6 +1,6 @@
 {
   "name": "@snow-the/dsh-research-lab",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Research lab for DeepSeek Harness: AutoSci-style wiki (experiments/literature/decisions), ASI-Bench-grade eval rigor ledger, arXiv digest, adversarial paper review, and academic writing checks.",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,6 +19,7 @@
     "build:tests": "esbuild src/test-entry.ts --bundle --platform=node --format=esm --outfile=test-all.mjs --external:@deepseek-ai/* --log-level=warning",
     "pretest": "npm run build:tests",
     "test": "node test-suite.mjs",
+    "test:absorb": "node --import ./test-hooks.mjs test-absorb.mjs",
     "prefuzz": "npm run build:tests",
     "fuzz": "node test-fuzz-ingest.mjs"
   },

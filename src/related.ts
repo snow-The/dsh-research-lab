@@ -45,6 +45,17 @@ export function openDb(project: string): DatabaseSync {
     CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
       INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', old.id, old.title, old.body);
     END;
+    -- Absorb ledger. Without it rlab_absorb re-read the FIRST max files of a directory on every call:
+    -- there was no cursor, no skip and no dedupe, so a second call re-did the same work and reported
+    -- "0 skipped" every time, and the docs table gained a duplicate row per call. 'key' is the cheap
+    -- change detector (size:mtimeMs) so an unchanged file is skipped without reading it at all.
+    CREATE TABLE IF NOT EXISTS absorbed (
+      path TEXT PRIMARY KEY,
+      key TEXT NOT NULL DEFAULT '',
+      doc_id INTEGER,
+      page TEXT,
+      ts TEXT DEFAULT (date('now'))
+    );
   `);
   return db;
 }
@@ -183,6 +194,43 @@ export function hybridSearch(project: string, query: string, k = 10): RelatedDoc
   const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([id]) => Number(id));
   const byId = new Map(rows.map(d => [d.id, d]));
   return ranked.map(id => byId.get(id)).filter((d): d is RelatedDoc => !!d);
+}
+
+/** One ledger row: the cheap change key and the doc/page it produced. */
+export interface AbsorbRow { path: string; key: string; doc_id: number | null; page: string | null }
+
+/** The absorb ledger for a project, keyed by project-relative path. */
+export function absorbLedger(project: string): Map<string, AbsorbRow> {
+  const db = openDb(project);
+  const rows = db.prepare('SELECT path, key, doc_id, page FROM absorbed').all() as unknown as AbsorbRow[];
+  return new Map(rows.map((r) => [r.path, r]));
+}
+
+/** Record a file as absorbed (upsert — the path is the identity, the key is its content state). */
+export function recordAbsorbed(project: string, row: { path: string; key: string; docId?: number | null; page?: string | null }): void {
+  const db = openDb(project);
+  db.prepare(`INSERT INTO absorbed(path, key, doc_id, page, ts) VALUES (?,?,?,?,date('now'))
+    ON CONFLICT(path) DO UPDATE SET key=excluded.key, doc_id=excluded.doc_id, page=excluded.page, ts=excluded.ts`)
+    .run(row.path, row.key, row.docId ?? null, row.page ?? null);
+}
+
+/**
+ * Replace an existing indexed document in place. A report that CHANGED must not become a second row:
+ * the old code inserted on every absorb, so one edited file appeared in the corpus as many times as
+ * it was absorbed.
+ */
+export function updateDoc(project: string, id: number, title: string, body: string, source: string): boolean {
+  const db = openDb(project);
+  const safeTitle = typeof title === 'string' && title.trim().length > 0 ? title : '(untitled)';
+  const before = db.prepare('SELECT title, body FROM docs WHERE id=?').get(id) as { title: string; body: string } | undefined;
+  if (before === undefined) return false;
+  // The FTS table is external-content: its row has to be re-synced explicitly around the update.
+  db.prepare("INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', ?, ?, ?)").run(id, before.title, before.body);
+  db.prepare('UPDATE docs SET title=?, body=?, source=?, added=date(\'now\') WHERE id=?')
+    .run(safeTitle, ftsText(safeTitle + ' ' + (typeof body === 'string' ? body : '')), source, id);
+  db.prepare('INSERT INTO docs_fts(rowid, title, body) VALUES (?,?,?)').run(id, safeTitle, ftsText(safeTitle + ' ' + (typeof body === 'string' ? body : '')));
+  mineKeywords(project, 40);
+  return true;
 }
 
 export function addDoc(project: string, title: string, body: string, source: string): number {
