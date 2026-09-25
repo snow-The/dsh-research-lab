@@ -734,13 +734,19 @@ export async function apply(ctx: any) {
           const page = writeWikiPage(project, { kind: kind as any, id: slug, title: slug + ' (absorbed)', updated: today(), content: text.slice(0, 5000) + '\n\n---\nSource: ' + f.rel, tags: ['absorb', path.basename(path.dirname(f.full))] });
           const before = ledger.get(f.rel);
           let docId: number | null = null;
-          if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, 'absorb')) { docId = before.doc_id; updatedInPlace++; }
-          else docId = addDoc(project, f.rel, text, 'absorb');
+          // refreshLexicon:false — the lexicon is corpus-wide, so refreshing it per document made an
+          // N-file absorb quadratic (measured on a real 125-file backlog with a 427-doc corpus: ~1.9 s
+          // PER FILE, against ~46 ms on the batch path). One refresh at the end instead.
+          if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, 'absorb', { refreshLexicon: false })) { docId = before.doc_id; updatedInPlace++; }
+          else docId = addDoc(project, f.rel, text, 'absorb', { refreshLexicon: false });
           recordAbsorbed(project, { path: f.rel, key: f.key, docId, page });
           absorbed++;
         } catch { failed++; }
         await new Promise((r) => setImmediate(r));   // let the host breathe between files
       }
+
+      // ONE lexicon refresh for the whole batch (see the note above the calls).
+      if (absorbed > 0) mineKeywords(project, 40);
 
       const remaining = Math.max(0, pending.length - absorbed - failed);
       return 'Absorbed ' + absorbed + ' report(s) — ' + seen.size + ' found, ' + unchanged + ' unchanged since the last run, '

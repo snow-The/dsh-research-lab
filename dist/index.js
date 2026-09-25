@@ -2212,10 +2212,10 @@ async function apply(ctx) {
           const page = writeWikiPage(project, { kind, id: slug, title: slug + " (absorbed)", updated: today(), content: text.slice(0, 5e3) + "\n\n---\nSource: " + f.rel, tags: ["absorb", path7.basename(path7.dirname(f.full))] });
           const before = ledger.get(f.rel);
           let docId = null;
-          if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, "absorb")) {
+          if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, "absorb", { refreshLexicon: false })) {
             docId = before.doc_id;
             updatedInPlace++;
-          } else docId = addDoc(project, f.rel, text, "absorb");
+          } else docId = addDoc(project, f.rel, text, "absorb", { refreshLexicon: false });
           recordAbsorbed(project, { path: f.rel, key: f.key, docId, page });
           absorbed++;
         } catch {
@@ -2223,6 +2223,7 @@ async function apply(ctx) {
         }
         await new Promise((r) => setImmediate(r));
       }
+      if (absorbed > 0) mineKeywords(project, 40);
       const remaining = Math.max(0, pending.length - absorbed - failed);
       return "Absorbed " + absorbed + " report(s) \u2014 " + seen.size + " found, " + unchanged + " unchanged since the last run, " + failed + " failed" + (updatedInPlace > 0 ? ", " + updatedInPlace + " re-indexed in place (the file changed)" : "") + "\nfrom: " + (dirs.filter((d) => fs7.existsSync(d)).join(", ") || "(no dirs)") + "\nwiki pages: " + absorbed + " | related.db docs: " + absorbed + (remaining > 0 ? "\n" + remaining + " still pending \u2014 call again with the same arguments; the ledger skips everything already done." : "\nNothing left to absorb in those directories.");
     }

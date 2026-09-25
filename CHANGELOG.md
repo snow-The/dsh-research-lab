@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.3
+
+- fix(rlab_absorb): the batch path still refreshed the corpus-wide TF-IDF lexicon **per document** —
+  the same O(N^2) that v0.2.2 removed from ingest, missed on the absorb side. Found by running the fix
+  on the REAL backlog that hung the host (`~/01/r32/batch/out`, 125 reports over a 427-document corpus):
+  `max=20` took **9,723 ms and absorbed 5 files** (~1,900 ms/file), against ~46 ms/file on the ingest
+  path. `addDoc`/`updateDoc` now get `refreshLexicon:false` and the batch refreshes ONCE:
+  **50 files in 2,833 ms (~57 ms/file, 33x)**, the whole 125-file backlog absorbed in three bounded
+  calls (8.8 s total, each returning inside its budget), and a re-run is 7 ms with 125 unchanged.
+- test: the absorb suite gained a wall-clock ceiling (72 files, < 20 s) — at the old per-file rate that
+  workload needed ~2.3 minutes, so the quadratic cannot come back unnoticed.
 ## 0.2.2
 
 - fix(rlab_related ingest): the second tool that could hang the host — for three reasons at once.
