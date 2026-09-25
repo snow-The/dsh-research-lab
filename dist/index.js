@@ -618,7 +618,7 @@ function recordAbsorbed(project, row) {
   db.prepare(`INSERT INTO absorbed(path, key, doc_id, page, ts) VALUES (?,?,?,?,date('now'))
     ON CONFLICT(path) DO UPDATE SET key=excluded.key, doc_id=excluded.doc_id, page=excluded.page, ts=excluded.ts`).run(row.path, row.key, row.docId ?? null, row.page ?? null);
 }
-function updateDoc(project, id, title, body, source) {
+function updateDoc(project, id, title, body, source, opts = {}) {
   const db = openDb(project);
   const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
   const before = db.prepare("SELECT title, body FROM docs WHERE id=?").get(id);
@@ -626,31 +626,36 @@ function updateDoc(project, id, title, body, source) {
   db.prepare("INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', ?, ?, ?)").run(id, before.title, before.body);
   db.prepare("UPDATE docs SET title=?, body=?, source=?, added=date('now') WHERE id=?").run(safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")), source, id);
   db.prepare("INSERT INTO docs_fts(rowid, title, body) VALUES (?,?,?)").run(id, safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")));
-  mineKeywords(project, 40);
+  if (opts.refreshLexicon !== false) mineKeywords(project, 40);
   return true;
 }
-function addDoc(project, title, body, source) {
+function addDoc(project, title, body, source, opts = {}) {
   const db = openDb(project);
   const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
   const safeBody = typeof body === "string" ? body : "";
   const safeSource = typeof source === "string" ? source : "";
   const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(safeTitle, ftsText(safeTitle + " " + safeBody), safeSource);
-  mineKeywords(project, 40);
+  if (opts.refreshLexicon !== false) mineKeywords(project, 40);
   return Number(r.lastInsertRowid);
 }
-function ingestDocDir(project, dir, maxFiles = 200) {
+function ingestDocDir(project, dir, opts = {}) {
+  const o = typeof opts === "number" ? { max: opts } : opts ?? {};
+  const max = Math.max(1, Number(o.max) || 200);
+  const budgetMs = Math.max(50, Number(o.budgetMs) || 4e3);
+  const prefix = o.ledgerPrefix ?? "ingest:";
+  const empty = { found: 0, added: 0, updated: 0, skipped: 0, unchanged: 0, remaining: 0 };
   const root = path2.resolve(dir);
-  if (!fs2.existsSync(root)) return { added: 0, skipped: 0 };
+  if (!fs2.existsSync(root)) return empty;
   let isDirectory = false;
   try {
     isDirectory = fs2.statSync(root).isDirectory();
   } catch {
     isDirectory = false;
   }
-  if (!isDirectory) return { added: 0, skipped: 0 };
-  let added = 0, skipped = 0;
+  if (!isDirectory) return empty;
+  const files = [];
   const walk = (d, depth) => {
-    if (depth > 4 || added >= maxFiles) return;
+    if (depth > 4) return;
     let entries = [];
     try {
       entries = fs2.readdirSync(d, { withFileTypes: true });
@@ -664,23 +669,49 @@ function ingestDocDir(project, dir, maxFiles = 200) {
         walk(full, depth + 1);
         continue;
       }
-      if (!f.name.endsWith(".md") && !f.name.endsWith(".mdx")) {
-        skipped++;
+      if (!f.name.endsWith(".md") && !f.name.endsWith(".mdx")) continue;
+      let st;
+      try {
+        st = fs2.statSync(full);
+      } catch {
         continue;
       }
-      if (added >= maxFiles) return;
-      try {
-        const text = fs2.readFileSync(full, "utf8").slice(0, 2e4);
-        const rel = path2.relative(root, full);
-        addDoc(project, rel, text, "ingest:" + path2.basename(root));
-        added++;
-      } catch {
-        skipped++;
-      }
+      files.push({ full, rel: path2.relative(root, full), key: st.size + ":" + Math.round(st.mtimeMs), mtimeMs: st.mtimeMs });
     }
   };
   walk(root, 0);
-  return { added, skipped };
+  const ledger = absorbLedger(project);
+  const pending = files.filter((f) => ledger.get(prefix + f.rel)?.key !== f.key).sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const started = Date.now();
+  let added = 0, updated = 0, skipped = 0;
+  for (const f of pending) {
+    if (added + updated >= max) break;
+    if (Date.now() - started > budgetMs) break;
+    try {
+      const text = fs2.readFileSync(f.full, "utf8").slice(0, 2e4);
+      const before = ledger.get(prefix + f.rel);
+      let docId = null;
+      if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, "ingest:" + path2.basename(root), { refreshLexicon: false })) {
+        docId = before.doc_id;
+        updated++;
+      } else {
+        docId = addDoc(project, f.rel, text, "ingest:" + path2.basename(root), { refreshLexicon: false });
+        added++;
+      }
+      recordAbsorbed(project, { path: prefix + f.rel, key: f.key, docId, page: null });
+    } catch {
+      skipped++;
+    }
+  }
+  if (added + updated > 0) mineKeywords(project, 40);
+  return {
+    found: files.length,
+    added,
+    updated,
+    skipped,
+    unchanged: files.length - pending.length,
+    remaining: Math.max(0, pending.length - added - updated - skipped)
+  };
 }
 function topKeywords(project, topN = 30) {
   const db = openDb(project);
@@ -1973,7 +2004,9 @@ async function apply(ctx) {
       rounds: { type: "number", description: "expansion rounds (default 2, max 4)" },
       external: { type: "boolean", description: "also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)" },
       topN: { type: "number", description: "lexicon size for keywords (default 30)" },
-      dir: { type: "string", description: "directory to bulk-ingest (ingest). Default: auto-detect .dsh-lib-analyzer/pages, .rlab/wiki, batch/out" }
+      dir: { type: "string", description: "directory to bulk-ingest (ingest). Default: auto-detect .dsh-lib-analyzer/pages, .rlab/wiki, batch/out" },
+      max: { type: "number", description: "ingest at most N files in THIS call (default 200); files already ingested and unchanged are skipped by the ledger, so call again with the same arguments to continue" },
+      budgetMs: { type: "number", description: "wall-clock budget for one ingest call (default 8000) - the tool yields between chunks and stops at the budget, so a big directory cannot block the host" }
     },
     output: textOut,
     timeoutMs: 6e4,
@@ -2030,19 +2063,31 @@ async function apply(ctx) {
         case "ingest": {
           const dir = String(args?.dir ?? "").trim();
           const cands = dir ? [dir] : [path7.join(project, ".dsh-lib-analyzer", "pages"), path7.join(project, ".rlab", "wiki"), path7.join(project, "batch", "out")];
+          const want = Math.max(1, Number(args?.max) || 200);
+          const budget = Math.max(200, Number(args?.budgetMs) || 8e3);
+          const startedAt = Date.now();
           const parts = [];
-          let total = 0, skipped = 0;
+          let added = 0, updated = 0, failed = 0, unchanged = 0, remaining = 0;
           for (const cdir of cands) {
             if (!fs7.existsSync(cdir)) {
               if (dir) throw new Error("dir not found: " + cdir);
               continue;
             }
-            const res = ingestDocDir(project, cdir);
-            total += res.added;
-            skipped += res.skipped;
-            parts.push(path7.basename(cdir) + ":+" + res.added);
+            for (; ; ) {
+              const left = want - added - updated;
+              const chunk = ingestDocDir(project, cdir, { max: Math.max(1, Math.min(20, left)), budgetMs: 250 });
+              added += chunk.added;
+              updated += chunk.updated;
+              failed += chunk.skipped;
+              unchanged = Math.max(unchanged, chunk.unchanged);
+              remaining = chunk.remaining;
+              if (chunk.found === 0) break;
+              if (chunk.remaining <= 0 || added + updated >= want || Date.now() - startedAt > budget) break;
+              await new Promise((r) => setImmediate(r));
+            }
+            parts.push(path7.basename(cdir) + ":+" + added);
           }
-          return "Ingested " + total + " files (skipped " + skipped + ") \u2014 " + (parts.join(" | ") || "(no ingest dirs found \u2014 pass dir=)") + "\nLexicon updated automatically. Try search or expand now.";
+          return "Ingested " + added + " new + " + updated + " updated (unchanged " + unchanged + ", failed " + failed + ") \u2014 " + (parts.join(" | ") || "(no ingest dirs found \u2014 pass dir=)") + (updated ? "\nChanged documents were re-indexed in place, not duplicated." : "") + (remaining > 0 ? "\n" + remaining + " still pending \u2014 call again with the same arguments; the ledger skips everything already ingested." : "\nNothing left to ingest there.") + "\nLexicon refreshed once for the whole batch. Try search or expand now.";
         }
         case "keywords": {
           const kw = topKeywords(project, topN);

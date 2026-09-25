@@ -1,6 +1,6 @@
 {
   "name": "@snow-the/dsh-research-lab",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Research lab for DeepSeek Harness: AutoSci-style wiki (experiments/literature/decisions), ASI-Bench-grade eval rigor ledger, arXiv digest, adversarial paper review, and academic writing checks.",
   "type": "module",
   "main": "./dist/index.js",
@@ -20,6 +20,7 @@
     "pretest": "npm run build:tests",
     "test": "node test-suite.mjs",
     "test:absorb": "node --import ./test-hooks.mjs test-absorb.mjs",
+    "test:ingest": "node --import ./test-hooks.mjs test-ingest.mjs",
     "prefuzz": "npm run build:tests",
     "fuzz": "node test-fuzz-ingest.mjs"
   },

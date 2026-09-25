@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.2
+
+- fix(rlab_related ingest): the second tool that could hang the host — for three reasons at once.
+  - **No ledger**: a repeat call re-read and re-inserted the same files (124 done, run it again -> the
+    same 124 again) and the docs table gained a duplicate row each time. Files are now keyed by
+    `size:mtime` in the same absorb ledger, so a repeat call is a no-op and a NEW file is picked up.
+  - **No bound**: `maxFiles` defaulted to 200 and the loop ran to completion. `ingest` now takes `max`
+    (per call, default 200) and `budgetMs` (default 8000), and the TOOL drives it in bounded chunks with
+    a yield to the event loop between them — the document layer is synchronous by design (node:sqlite
+    `DatabaseSync` + sync fs), so the tool is what has to hand the loop back.
+  - **A hidden quadratic**: `addDoc` refreshed the corpus-wide TF-IDF lexicon after EVERY insert, so an
+    N-file ingest paid O(N^2) tokenization — this is what turned 124 files into a hang, not the file
+    count. `addDoc`/`updateDoc` take `refreshLexicon:false` and the batch refreshes ONCE at the end.
+  - An EDITED document is re-indexed **in place** (FTS row re-synced) instead of being added again, and
+    the result reports new / updated / unchanged / failed / still pending with a "call again" hint.
+  - `ingestDocDir` keeps its synchronous signature (a number or an options object as the third
+    argument) because the fuzz suite drives it directly; the returned object gained fields and its
+    `skipped` now means "a file failed", not "a file was not .md".
+- test: `npm run test:ingest` pins resumability, the wall-clock bound (201/250/311 ms per 10-file
+  call) and one row per file; `npm run test:absorb` covers the same contract for absorb. Existing suite
+  28/28, fuzz 0 problems.
 ## 0.2.1
 
 - fix(rlab_absorb): the tool had **no cursor and no ledger**. It collected the first `max` files of a

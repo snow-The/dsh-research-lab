@@ -519,6 +519,8 @@ export async function apply(ctx: any) {
       external: { type: 'boolean', description: 'also mine suggestion terms from Wikipedia opensearch (en+zh, network; degrades silently offline)' },
       topN: { type: 'number', description: 'lexicon size for keywords (default 30)' },
       dir: { type: 'string', description: 'directory to bulk-ingest (ingest). Default: auto-detect .dsh-lib-analyzer/pages, .rlab/wiki, batch/out' },
+      max: { type: 'number', description: 'ingest at most N files in THIS call (default 200); files already ingested and unchanged are skipped by the ledger, so call again with the same arguments to continue' },
+      budgetMs: { type: 'number', description: 'wall-clock budget for one ingest call (default 8000) - the tool yields between chunks and stops at the budget, so a big directory cannot block the host' },
     },
     output: textOut,
     timeoutMs: 60000,
@@ -576,15 +578,35 @@ export async function apply(ctx: any) {
         case 'ingest': {
           const dir = String(args?.dir ?? '').trim();
           const cands = dir ? [dir] : [path.join(project, '.dsh-lib-analyzer', 'pages'), path.join(project, '.rlab', 'wiki'), path.join(project, 'batch', 'out')];
+          const want = Math.max(1, Number(args?.max) || 200);
+          const budget = Math.max(200, Number(args?.budgetMs) || 8000);
+          const startedAt = Date.now();
           const parts: string[] = [];
-          let total = 0, skipped = 0;
+          let added = 0, updated = 0, failed = 0, unchanged = 0, remaining = 0;
           for (const cdir of cands) {
             if (!fs.existsSync(cdir)) { if (dir) throw new Error('dir not found: ' + cdir); continue; }
-            const res = ingestDocDir(project, cdir);
-            total += res.added; skipped += res.skipped;
-            parts.push(path.basename(cdir) + ':+' + res.added);
+            // The document layer is synchronous by design (node:sqlite DatabaseSync + sync fs), so the
+            // TOOL is what has to hand the event loop back: bounded chunks, a yield between them, and a
+            // wall-clock budget. Without this a 124-file ingest stopped every other agent dead.
+            for (;;) {
+              const left = want - added - updated;
+              const chunk = ingestDocDir(project, cdir, { max: Math.max(1, Math.min(20, left)), budgetMs: 250 });
+              added += chunk.added; updated += chunk.updated; failed += chunk.skipped;
+              unchanged = Math.max(unchanged, chunk.unchanged);
+              remaining = chunk.remaining;
+              if (chunk.found === 0) break;
+              if (chunk.remaining <= 0 || added + updated >= want || Date.now() - startedAt > budget) break;
+              await new Promise((r) => setImmediate(r));
+            }
+            parts.push(path.basename(cdir) + ':+' + added);
           }
-          return 'Ingested ' + total + ' files (skipped ' + skipped + ') — ' + (parts.join(' | ') || '(no ingest dirs found — pass dir=)') + '\nLexicon updated automatically. Try search or expand now.';
+          return 'Ingested ' + added + ' new + ' + updated + ' updated (unchanged ' + unchanged + ', failed ' + failed + ')'
+            + ' — ' + (parts.join(' | ') || '(no ingest dirs found — pass dir=)')
+            + (updated ? '\nChanged documents were re-indexed in place, not duplicated.' : '')
+            + (remaining > 0
+              ? '\n' + remaining + ' still pending — call again with the same arguments; the ledger skips everything already ingested.'
+              : '\nNothing left to ingest there.')
+            + '\nLexicon refreshed once for the whole batch. Try search or expand now.';
         }
         case 'keywords': {
           const kw = topKeywords(project, topN);

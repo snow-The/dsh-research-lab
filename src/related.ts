@@ -219,7 +219,7 @@ export function recordAbsorbed(project: string, row: { path: string; key: string
  * the old code inserted on every absorb, so one edited file appeared in the corpus as many times as
  * it was absorbed.
  */
-export function updateDoc(project: string, id: number, title: string, body: string, source: string): boolean {
+export function updateDoc(project: string, id: number, title: string, body: string, source: string, opts: { refreshLexicon?: boolean } = {}): boolean {
   const db = openDb(project);
   const safeTitle = typeof title === 'string' && title.trim().length > 0 ? title : '(untitled)';
   const before = db.prepare('SELECT title, body FROM docs WHERE id=?').get(id) as { title: string; body: string } | undefined;
@@ -229,11 +229,11 @@ export function updateDoc(project: string, id: number, title: string, body: stri
   db.prepare('UPDATE docs SET title=?, body=?, source=?, added=date(\'now\') WHERE id=?')
     .run(safeTitle, ftsText(safeTitle + ' ' + (typeof body === 'string' ? body : '')), source, id);
   db.prepare('INSERT INTO docs_fts(rowid, title, body) VALUES (?,?,?)').run(id, safeTitle, ftsText(safeTitle + ' ' + (typeof body === 'string' ? body : '')));
-  mineKeywords(project, 40);
+  if (opts.refreshLexicon !== false) mineKeywords(project, 40);
   return true;
 }
 
-export function addDoc(project: string, title: string, body: string, source: string): number {
+export function addDoc(project: string, title: string, body: string, source: string, opts: { refreshLexicon?: boolean } = {}): number {
   const db = openDb(project);
   // Values arrive from tools, from directory ingest and from tests. An omitted field used
   // to reach SQLite as `undefined` ("Provided value cannot be bound to SQLite parameter 1")
@@ -245,43 +245,93 @@ export function addDoc(project: string, title: string, body: string, source: str
   const safeSource = typeof source === 'string' ? source : '';
   const r = db.prepare('INSERT INTO docs(title, body, source) VALUES (?,?,?)')
     .run(safeTitle, ftsText(safeTitle + ' ' + safeBody), safeSource);
-  mineKeywords(project, 40); // refresh lexicon incrementally
+  // Refreshing here is right for ONE document and catastrophic for a batch: mineKeywords re-reads and
+  // re-tokenizes the entire corpus, so an N-file ingest used to pay O(N^2) tokenization (124 files was
+  // enough to hang the host). Batch callers pass refreshLexicon:false and refresh ONCE at the end.
+  if (opts.refreshLexicon !== false) mineKeywords(project, 40);
   return Number(r.lastInsertRowid);
 }
 
 // Bulk-ingest .md files from a directory (e.g. .dsh-lib-analyzer/pages, batch/out, w8/ref) —
 // interoperability with dsh-lib-analyzer knowledge pages and absorption reports.
-export function ingestDocDir(project: string, dir: string, maxFiles = 200): { added: number; skipped: number } {
+export interface IngestOpts { max?: number; budgetMs?: number; ledgerPrefix?: string }
+export interface IngestResult { found: number; added: number; updated: number; skipped: number; unchanged: number; remaining: number }
+
+/**
+ * Bulk-ingest .md files from a directory, RESUMABLY.
+ *
+ * Two defects made this the tool that hung the host: it had no ledger (every call re-read and
+ * re-inserted the same files, so a second identical call was pure repeated work), and it had no bound
+ * (maxFiles defaulted to 200 and the loop ran to completion synchronously). The third one was hidden
+ * inside addDoc: every insert rebuilt the corpus-wide TF-IDF lexicon, so an N-file ingest paid O(N^2)
+ * tokenization. Now: files are keyed by size:mtime in the absorb ledger, at most `max` are written per
+ * call inside a `budgetMs` window, and the lexicon is refreshed ONCE at the end.
+ *
+ * The caller is still responsible for yielding to the event loop between calls (the tool does it per
+ * chunk); this function stays synchronous so the fuzz suite can drive it directly.
+ */
+export function ingestDocDir(project: string, dir: string, opts: number | IngestOpts = {}): IngestResult {
+  const o: IngestOpts = typeof opts === 'number' ? { max: opts } : (opts ?? {});
+  const max = Math.max(1, Number(o.max) || 200);
+  const budgetMs = Math.max(50, Number(o.budgetMs) || 4000);
+  const prefix = o.ledgerPrefix ?? 'ingest:';
+  const empty: IngestResult = { found: 0, added: 0, updated: 0, skipped: 0, unchanged: 0, remaining: 0 };
   const root = path.resolve(dir);
-  if (!fs.existsSync(root)) return { added: 0, skipped: 0 };
+  if (!fs.existsSync(root)) return empty;
   // A FILE where a directory is expected (or a path that vanished between the existsSync
   // and the stat) used to throw ENOTDIR straight out of the tool. Report a shaped result.
   let isDirectory = false;
   try { isDirectory = fs.statSync(root).isDirectory(); } catch { isDirectory = false; }
-  if (!isDirectory) return { added: 0, skipped: 0 };
-  let added = 0, skipped = 0;
+  if (!isDirectory) return empty;
+
+  // Collect first (names + stat only), so `remaining` is a real number rather than a guess.
+  const files: { full: string; rel: string; key: string; mtimeMs: number }[] = [];
   const walk = (d: string, depth: number) => {
-    if (depth > 4 || added >= maxFiles) return;
+    if (depth > 4) return;
     let entries: fs.Dirent[] = [];
-    // Unreadable or concurrently removed directories end this branch, they do not abort
-    // the whole ingest.
+    // Unreadable or concurrently removed directories end this branch, they do not abort the ingest.
     try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
     for (const f of entries) {
       if (f.name.startsWith('.')) continue;
       const full = path.join(d, f.name);
       if (f.isDirectory()) { walk(full, depth + 1); continue; }
-      if (!f.name.endsWith('.md') && !f.name.endsWith('.mdx')) { skipped++; continue; }
-      if (added >= maxFiles) return;
-      try {
-        const text = fs.readFileSync(full, 'utf8').slice(0, 20000);
-        const rel = path.relative(root, full);
-        addDoc(project, rel, text, 'ingest:' + path.basename(root));
-        added++;
-      } catch { skipped++; }
+      if (!f.name.endsWith('.md') && !f.name.endsWith('.mdx')) continue;
+      let st: fs.Stats;
+      try { st = fs.statSync(full); } catch { continue; }
+      files.push({ full, rel: path.relative(root, full), key: st.size + ':' + Math.round(st.mtimeMs), mtimeMs: st.mtimeMs });
     }
   };
   walk(root, 0);
-  return { added, skipped };
+
+  const ledger = absorbLedger(project);
+  const pending = files
+    .filter((f) => ledger.get(prefix + f.rel)?.key !== f.key)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);   // newest first: a fresh page never queues behind a backlog
+  const started = Date.now();
+  let added = 0, updated = 0, skipped = 0;
+  for (const f of pending) {
+    if (added + updated >= max) break;
+    if (Date.now() - started > budgetMs) break;
+    try {
+      const text = fs.readFileSync(f.full, 'utf8').slice(0, 20000);
+      const before = ledger.get(prefix + f.rel);
+      let docId: number | null = null;
+      if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, 'ingest:' + path.basename(root), { refreshLexicon: false })) {
+        docId = before.doc_id; updated++;
+      } else {
+        docId = addDoc(project, f.rel, text, 'ingest:' + path.basename(root), { refreshLexicon: false }); added++;
+      }
+      recordAbsorbed(project, { path: prefix + f.rel, key: f.key, docId, page: null });
+    } catch { skipped++; }
+  }
+  // ONE refresh for the batch. Per document it was corpus-wide work, i.e. quadratic in the batch size.
+  if (added + updated > 0) mineKeywords(project, 40);
+  return {
+    found: files.length,
+    added, updated, skipped,
+    unchanged: files.length - pending.length,
+    remaining: Math.max(0, pending.length - added - updated - skipped),
+  };
 }
 
 export function topKeywords(project: string, topN = 30): KeywordHit[] {

@@ -340,7 +340,7 @@ function recordAbsorbed(project, row) {
   db.prepare(`INSERT INTO absorbed(path, key, doc_id, page, ts) VALUES (?,?,?,?,date('now'))
     ON CONFLICT(path) DO UPDATE SET key=excluded.key, doc_id=excluded.doc_id, page=excluded.page, ts=excluded.ts`).run(row.path, row.key, row.docId ?? null, row.page ?? null);
 }
-function updateDoc(project, id, title, body, source) {
+function updateDoc(project, id, title, body, source, opts = {}) {
   const db = openDb(project);
   const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
   const before = db.prepare("SELECT title, body FROM docs WHERE id=?").get(id);
@@ -348,31 +348,36 @@ function updateDoc(project, id, title, body, source) {
   db.prepare("INSERT INTO docs_fts(docs_fts, rowid, title, body) VALUES('delete', ?, ?, ?)").run(id, before.title, before.body);
   db.prepare("UPDATE docs SET title=?, body=?, source=?, added=date('now') WHERE id=?").run(safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")), source, id);
   db.prepare("INSERT INTO docs_fts(rowid, title, body) VALUES (?,?,?)").run(id, safeTitle, ftsText(safeTitle + " " + (typeof body === "string" ? body : "")));
-  mineKeywords(project, 40);
+  if (opts.refreshLexicon !== false) mineKeywords(project, 40);
   return true;
 }
-function addDoc(project, title, body, source) {
+function addDoc(project, title, body, source, opts = {}) {
   const db = openDb(project);
   const safeTitle = typeof title === "string" && title.trim().length > 0 ? title : "(untitled)";
   const safeBody = typeof body === "string" ? body : "";
   const safeSource = typeof source === "string" ? source : "";
   const r = db.prepare("INSERT INTO docs(title, body, source) VALUES (?,?,?)").run(safeTitle, ftsText(safeTitle + " " + safeBody), safeSource);
-  mineKeywords(project, 40);
+  if (opts.refreshLexicon !== false) mineKeywords(project, 40);
   return Number(r.lastInsertRowid);
 }
-function ingestDocDir(project, dir, maxFiles = 200) {
+function ingestDocDir(project, dir, opts = {}) {
+  const o = typeof opts === "number" ? { max: opts } : opts ?? {};
+  const max = Math.max(1, Number(o.max) || 200);
+  const budgetMs = Math.max(50, Number(o.budgetMs) || 4e3);
+  const prefix = o.ledgerPrefix ?? "ingest:";
+  const empty = { found: 0, added: 0, updated: 0, skipped: 0, unchanged: 0, remaining: 0 };
   const root = path.resolve(dir);
-  if (!fs.existsSync(root)) return { added: 0, skipped: 0 };
+  if (!fs.existsSync(root)) return empty;
   let isDirectory = false;
   try {
     isDirectory = fs.statSync(root).isDirectory();
   } catch {
     isDirectory = false;
   }
-  if (!isDirectory) return { added: 0, skipped: 0 };
-  let added = 0, skipped = 0;
+  if (!isDirectory) return empty;
+  const files = [];
   const walk = (d, depth) => {
-    if (depth > 4 || added >= maxFiles) return;
+    if (depth > 4) return;
     let entries = [];
     try {
       entries = fs.readdirSync(d, { withFileTypes: true });
@@ -386,23 +391,49 @@ function ingestDocDir(project, dir, maxFiles = 200) {
         walk(full, depth + 1);
         continue;
       }
-      if (!f.name.endsWith(".md") && !f.name.endsWith(".mdx")) {
-        skipped++;
+      if (!f.name.endsWith(".md") && !f.name.endsWith(".mdx")) continue;
+      let st;
+      try {
+        st = fs.statSync(full);
+      } catch {
         continue;
       }
-      if (added >= maxFiles) return;
-      try {
-        const text = fs.readFileSync(full, "utf8").slice(0, 2e4);
-        const rel = path.relative(root, full);
-        addDoc(project, rel, text, "ingest:" + path.basename(root));
-        added++;
-      } catch {
-        skipped++;
-      }
+      files.push({ full, rel: path.relative(root, full), key: st.size + ":" + Math.round(st.mtimeMs), mtimeMs: st.mtimeMs });
     }
   };
   walk(root, 0);
-  return { added, skipped };
+  const ledger = absorbLedger(project);
+  const pending = files.filter((f) => ledger.get(prefix + f.rel)?.key !== f.key).sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const started = Date.now();
+  let added = 0, updated = 0, skipped = 0;
+  for (const f of pending) {
+    if (added + updated >= max) break;
+    if (Date.now() - started > budgetMs) break;
+    try {
+      const text = fs.readFileSync(f.full, "utf8").slice(0, 2e4);
+      const before = ledger.get(prefix + f.rel);
+      let docId = null;
+      if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, "ingest:" + path.basename(root), { refreshLexicon: false })) {
+        docId = before.doc_id;
+        updated++;
+      } else {
+        docId = addDoc(project, f.rel, text, "ingest:" + path.basename(root), { refreshLexicon: false });
+        added++;
+      }
+      recordAbsorbed(project, { path: prefix + f.rel, key: f.key, docId, page: null });
+    } catch {
+      skipped++;
+    }
+  }
+  if (added + updated > 0) mineKeywords(project, 40);
+  return {
+    found: files.length,
+    added,
+    updated,
+    skipped,
+    unchanged: files.length - pending.length,
+    remaining: Math.max(0, pending.length - added - updated - skipped)
+  };
 }
 function topKeywords(project, topN = 30) {
   const db = openDb(project);
