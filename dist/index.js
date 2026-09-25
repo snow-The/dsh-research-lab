@@ -688,7 +688,7 @@ function ingestDocDir(project, dir, opts = {}) {
     if (added + updated >= max) break;
     if (Date.now() - started > budgetMs) break;
     try {
-      const text = fs2.readFileSync(f.full, "utf8").slice(0, 2e4);
+      const text = fs2.readFileSync(f.full, "utf8").slice(0, 2e4).toWellFormed();
       const before = ledger.get(prefix + f.rel);
       let docId = null;
       if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, "ingest:" + path2.basename(root), { refreshLexicon: false })) {
@@ -728,7 +728,7 @@ function expandSearch(project, seed, rounds = 2, k = 8) {
     final = hits;
     const toks = /* @__PURE__ */ new Map();
     for (const h of hits) {
-      const t = tokenize(h.title + " " + h.title + " " + h.body.slice(0, 2e3));
+      const t = tokenize(h.title + " " + h.title + " " + h.body.slice(0, 2e3).toWellFormed());
       for (const x of t) toks.set(x, (toks.get(x) || 0) + 1);
     }
     const newTerms = [...toks.entries()].filter(([t]) => !seenTerms.has(t)).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([t]) => t);
@@ -1267,7 +1267,7 @@ async function submitLocal(abs, model, token) {
   fd.append("optionalPayload", JSON.stringify(bestPayload(model)));
   fd.append("file", new Blob([fs5.readFileSync(abs)]), path5.basename(abs));
   const resp = await fetch(JOB_URL, { method: "POST", headers: { Authorization: "bearer " + token }, body: fd });
-  if (resp.status !== 200) throw new Error("submit failed " + resp.status + ": " + (await resp.text()).slice(0, 300));
+  if (resp.status !== 200) throw new Error("submit failed " + resp.status + ": " + (await resp.text()).slice(0, 300).toWellFormed());
   const j = await resp.json();
   return String(j.data.jobId);
 }
@@ -1840,7 +1840,7 @@ async function apply(ctx) {
           wseen.add(p.id);
           try {
             const slug = p.id.replace(/[^\w-]+/g, "").slice(0, 60);
-            const content = "## Title\n" + p.title + "\n\n## Authors\n" + (p.authors || []).join(", ").slice(0, 300) + "\n\n## Abstract\n" + (p.summary || "").slice(0, 1200) + "\n\n## Links\n- " + (p.absUrl || "") + "\n- " + (p.pdfUrl || "");
+            const content = "## Title\n" + p.title + "\n\n## Authors\n" + (p.authors || []).join(", ").slice(0, 300).toWellFormed() + "\n\n## Abstract\n" + (p.summary || "").slice(0, 1200) + "\n\n## Links\n- " + (p.absUrl || "") + "\n- " + (p.pdfUrl || "");
             writeWikiPage(project, { kind: "literature", id: slug, title: String(p.title).slice(0, 120), updated: today(), content, tags: ["arxiv", ...(p.categories || []).slice(0, 3)] });
             addDoc(project, "wiki/literature/" + slug, String(p.title) + "\n\n" + (p.summary || ""), "arxiv:" + p.id);
             wikiCount++;
@@ -2140,7 +2140,7 @@ async function apply(ctx) {
         lines.push("indexed into related.db: doc #" + id);
       }
       if (project && args?.wiki === true) {
-        const p = writeWikiPage(project, { kind: "literature", id: base, title: base + " (OCR)", updated: today(), content: md.text.slice(0, 4e3) + "\n\n---\nSource: " + file + " (PaddleOCR " + model + ")", tags: ["ocr"] });
+        const p = writeWikiPage(project, { kind: "literature", id: base, title: base + " (OCR)", updated: today(), content: md.text.slice(0, 4e3).toWellFormed() + "\n\n---\nSource: " + file + " (PaddleOCR " + model + ")", tags: ["ocr"] });
         lines.push("wiki page: " + p);
       }
       lines.push("quota note: 20000 free pages/day per model");
@@ -2207,7 +2207,7 @@ async function apply(ctx) {
         if (absorbed + failed >= max) break;
         if (Date.now() - started > budgetMs) break;
         try {
-          const text = fs7.readFileSync(f.full, "utf8").slice(0, 2e4);
+          const text = fs7.readFileSync(f.full, "utf8").slice(0, 2e4).toWellFormed();
           const slug = path7.basename(f.full, ".md").replace(/[^\w\u4e00-\u9fff-]+/g, "-").slice(0, 60) || "report";
           const page = writeWikiPage(project, { kind, id: slug, title: slug + " (absorbed)", updated: today(), content: text.slice(0, 5e3) + "\n\n---\nSource: " + f.rel, tags: ["absorb", path7.basename(path7.dirname(f.full))] });
           const before = ledger.get(f.rel);

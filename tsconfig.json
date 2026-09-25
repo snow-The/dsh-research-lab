@@ -1,9 +1,11 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2024",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
+    // ES2024 for String.prototype.toWellFormed: a byte-count truncation can split a UTF-16 surrogate
+    // pair, and a lone surrogate is not valid JSON text — the repair belongs at the truncation site.
+    "lib": ["ES2024"],
     "types": ["node"],
     "strict": true,
     "skipLibCheck": true,

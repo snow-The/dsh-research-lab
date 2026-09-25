@@ -410,7 +410,7 @@ function ingestDocDir(project, dir, opts = {}) {
     if (added + updated >= max) break;
     if (Date.now() - started > budgetMs) break;
     try {
-      const text = fs.readFileSync(f.full, "utf8").slice(0, 2e4);
+      const text = fs.readFileSync(f.full, "utf8").slice(0, 2e4).toWellFormed();
       const before = ledger.get(prefix + f.rel);
       let docId = null;
       if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, "ingest:" + path.basename(root), { refreshLexicon: false })) {
@@ -450,7 +450,7 @@ function expandSearch(project, seed, rounds = 2, k = 8) {
     final = hits;
     const toks = /* @__PURE__ */ new Map();
     for (const h of hits) {
-      const t = tokenize(h.title + " " + h.title + " " + h.body.slice(0, 2e3));
+      const t = tokenize(h.title + " " + h.title + " " + h.body.slice(0, 2e3).toWellFormed());
       for (const x of t) toks.set(x, (toks.get(x) || 0) + 1);
     }
     const newTerms = [...toks.entries()].filter(([t]) => !seenTerms.has(t)).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([t]) => t);

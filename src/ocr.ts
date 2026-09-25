@@ -53,7 +53,7 @@ async function submitLocal(abs: string, model: OcrModel, token: string): Promise
   fd.append('optionalPayload', JSON.stringify(bestPayload(model)));
   fd.append('file', new Blob([fs.readFileSync(abs)]), path.basename(abs));
   const resp = await fetch(JOB_URL, { method: 'POST', headers: { Authorization: 'bearer ' + token }, body: fd });
-  if (resp.status !== 200) throw new Error('submit failed ' + resp.status + ': ' + (await resp.text()).slice(0, 300));
+  if (resp.status !== 200) throw new Error('submit failed ' + resp.status + ': ' + (await resp.text()).slice(0, 300).toWellFormed());
   const j = (await resp.json()) as { data: { jobId: string } };
   return String(j.data.jobId);
 }

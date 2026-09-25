@@ -341,7 +341,7 @@ export async function apply(ctx: any) {
           wseen.add(p.id);
           try {
             const slug = p.id.replace(/[^\w-]+/g, '').slice(0, 60);
-            const content = '## Title\n' + p.title + '\n\n## Authors\n' + (p.authors || []).join(', ').slice(0, 300) +
+            const content = '## Title\n' + p.title + '\n\n## Authors\n' + (p.authors || []).join(', ').slice(0, 300).toWellFormed() +
               '\n\n## Abstract\n' + (p.summary || '').slice(0, 1200) + '\n\n## Links\n- ' + (p.absUrl || '') + '\n- ' + (p.pdfUrl || '');
             writeWikiPage(project, { kind: 'literature', id: slug, title: String(p.title).slice(0, 120), updated: today(), content, tags: ['arxiv', ...(p.categories || []).slice(0, 3)] });
             addDoc(project, 'wiki/literature/' + slug, String(p.title) + '\n\n' + (p.summary || ''), 'arxiv:' + p.id);
@@ -659,7 +659,7 @@ export async function apply(ctx: any) {
         lines.push('indexed into related.db: doc #' + id);
       }
       if (project && args?.wiki === true) {
-        const p = writeWikiPage(project, { kind: 'literature', id: base, title: base + ' (OCR)', updated: today(), content: md.text.slice(0, 4000) + '\n\n---\nSource: ' + file + ' (PaddleOCR ' + model + ')', tags: ['ocr'] });
+        const p = writeWikiPage(project, { kind: 'literature', id: base, title: base + ' (OCR)', updated: today(), content: md.text.slice(0, 4000).toWellFormed() + '\n\n---\nSource: ' + file + ' (PaddleOCR ' + model + ')', tags: ['ocr'] });
         lines.push('wiki page: ' + p);
       }
       lines.push('quota note: 20000 free pages/day per model');
@@ -729,7 +729,10 @@ export async function apply(ctx: any) {
         if (absorbed + failed >= max) break;
         if (Date.now() - started > budgetMs) break;
         try {
-          const text = fs.readFileSync(f.full, 'utf8').slice(0, 20000);
+          // .toWellFormed(): a byte-count slice can land inside a UTF-16 surrogate pair, and a lone surrogate is
+      // not valid JSON text — one stored/emitted half-character is enough to make every later request
+      // carrying it fail with a non-retryable 400. Repair at the truncation, not downstream.
+      const text = fs.readFileSync(f.full, 'utf8').slice(0, 20000).toWellFormed();
           const slug = path.basename(f.full, '.md').replace(/[^\w\u4e00-\u9fff-]+/g, '-').slice(0, 60) || 'report';
           const page = writeWikiPage(project, { kind: kind as any, id: slug, title: slug + ' (absorbed)', updated: today(), content: text.slice(0, 5000) + '\n\n---\nSource: ' + f.rel, tags: ['absorb', path.basename(path.dirname(f.full))] });
           const before = ledger.get(f.rel);

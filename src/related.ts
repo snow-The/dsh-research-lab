@@ -313,7 +313,8 @@ export function ingestDocDir(project: string, dir: string, opts: number | Ingest
     if (added + updated >= max) break;
     if (Date.now() - started > budgetMs) break;
     try {
-      const text = fs.readFileSync(f.full, 'utf8').slice(0, 20000);
+      // .toWellFormed(): see the note in index.ts — a slice can split a surrogate pair.
+      const text = fs.readFileSync(f.full, 'utf8').slice(0, 20000).toWellFormed();
       const before = ledger.get(prefix + f.rel);
       let docId: number | null = null;
       if (before?.doc_id != null && updateDoc(project, before.doc_id, f.rel, text, 'ingest:' + path.basename(root), { refreshLexicon: false })) {
@@ -357,7 +358,7 @@ export function expandSearch(project: string, seed: string, rounds = 2, k = 8): 
     // mine new terms from this round's top hits (title+body, weighted)
     const toks = new Map<string, number>();
     for (const h of hits) {
-      const t = tokenize(h.title + ' ' + h.title + ' ' + h.body.slice(0, 2000));
+      const t = tokenize(h.title + ' ' + h.title + ' ' + h.body.slice(0, 2000).toWellFormed());
       for (const x of t) toks.set(x, (toks.get(x) || 0) + 1);
     }
     const newTerms = [...toks.entries()]
