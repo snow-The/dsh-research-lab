@@ -740,74 +740,183 @@ function expandSearch(project, seed, rounds = 2, k = 8) {
   return { rounds: report, final, lexicon: topKeywords(project, 30) };
 }
 
-// src/acp.ts
+// src/acp-graph-contract.ts
 import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
 import { existsSync as existsSync3 } from "node:fs";
 import { join as join4 } from "node:path";
 import { homedir as homedir2 } from "node:os";
+var ACP_GRAPH_CONTRACT_VERSION = 1;
+var ACP_GRAPH_V1_REQUIRED = {
+  checkpoints: ["session_id", "seq_start", "seq_end", "summary", "created_at"],
+  checkpoint_nodes: ["session_id", "seq_start", "node_id"],
+  nodes: ["id", "kind", "title", "mention_count"],
+  cp_fts: ["session_id", "seq_start", "summary"],
+  node_fts: ["id", "title", "kind"],
+  docs: ["id", "kind", "title", "body", "source", "indexed_at"],
+  doc_fts: ["id", "kind", "title", "body"]
+};
+function acpGraphPath() {
+  return join4(process.env.DSH_HOME ?? join4(homedir2(), ".dsh"), "graph", "graph.db");
+}
 function ftsPhrase(q) {
   const toks = String(q ?? "").toLowerCase().replace(/["'^*:()\[\]{}]/g, " ").split(/\s+/).filter((t) => t.length > 1).slice(0, 8);
   return toks.length ? toks.map((t) => '"' + t + '"*').join(" OR ") : '""';
 }
-function acpGraphPath() {
-  return join4(process.env.DSH_HOME ?? join4(homedir2(), ".dsh"), "graph", "graph.db");
-}
-function warn(what, err) {
-  console.warn("[dsh-research-lab] " + what + ":", err instanceof Error ? err.message : String(err));
-}
-function acpGraphAvailable() {
+function tableColumns(db, table) {
   try {
-    if (!existsSync3(acpGraphPath())) return false;
-    const db = new DatabaseSync2(acpGraphPath(), { readOnly: true });
-    try {
-      const row = db.prepare("SELECT COUNT(*) AS c FROM checkpoints").get();
-      return (row?.c ?? 0) > 0;
-    } finally {
-      db.close();
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+    return rows.map((r) => r.name);
+  } catch {
+    return [];
+  }
+}
+function acpGraphStatus() {
+  const path8 = acpGraphPath();
+  const base = { path: path8, contractVersion: ACP_GRAPH_CONTRACT_VERSION };
+  if (!existsSync3(path8)) {
+    return { ...base, ok: false, stampedVersion: 0, stamped: false, reason: "no-db", detail: `graph.db not found at ${path8}` };
+  }
+  let db = null;
+  try {
+    db = new DatabaseSync2(path8, { readOnly: true });
+    const stampedVersion = Number(
+      db.prepare("PRAGMA user_version").get()?.user_version ?? 0
+    );
+    if (stampedVersion > ACP_GRAPH_CONTRACT_VERSION) {
+      return {
+        ...base,
+        ok: false,
+        stampedVersion,
+        stamped: true,
+        reason: "schema-mismatch",
+        detail: `graph.db is stamped v${stampedVersion} but this reader implements v${ACP_GRAPH_CONTRACT_VERSION}; upgrade the reader`
+      };
     }
-  } catch (err) {
-    warn("ACP graph probe failed", err);
-    return false;
+    const missing = {};
+    for (const [table, cols] of Object.entries(ACP_GRAPH_V1_REQUIRED)) {
+      const have = tableColumns(db, table);
+      if (have.length === 0) {
+        missing[table] = [...cols];
+        continue;
+      }
+      const lack = cols.filter((c) => !have.includes(c));
+      if (lack.length) missing[table] = lack;
+    }
+    if (Object.keys(missing).length) {
+      return {
+        ...base,
+        ok: false,
+        stampedVersion,
+        stamped: stampedVersion > 0,
+        reason: "schema-mismatch",
+        detail: "graph.db shape does not satisfy contract v1",
+        missing
+      };
+    }
+    if (stampedVersion === 0) {
+      return {
+        ...base,
+        ok: true,
+        stampedVersion,
+        stamped: false,
+        reason: "no-contract",
+        detail: "graph.db has no user_version stamp (created before the contract); shape verified against v1"
+      };
+    }
+    return { ...base, ok: true, stampedVersion, stamped: true, reason: "ok" };
+  } catch (e) {
+    return {
+      ...base,
+      ok: false,
+      stampedVersion: 0,
+      stamped: false,
+      reason: "error",
+      detail: e instanceof Error ? e.message : String(e)
+    };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+    }
+  }
+}
+function withAcpGraph(fn) {
+  const status = acpGraphStatus();
+  if (!status.ok) {
+    return {
+      ok: false,
+      reason: status.reason === "ok" ? "error" : status.reason,
+      detail: status.detail ?? status.reason,
+      status
+    };
+  }
+  let db = null;
+  try {
+    db = new DatabaseSync2(status.path, { readOnly: true });
+    return { ok: true, value: fn(db, status), status };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: "error",
+      detail: e instanceof Error ? e.message : String(e),
+      status
+    };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+    }
   }
 }
 function acpGraphRecall(query, limit = 4) {
-  try {
-    if (!acpGraphAvailable()) return [];
-    const db = new DatabaseSync2(acpGraphPath(), { readOnly: true });
+  return withAcpGraph((db) => {
+    const q = String(query ?? "").toLowerCase().trim();
+    if (!q) return [];
+    const matchQ = ftsPhrase(q);
+    const out = [];
     try {
-      const q = String(query ?? "").toLowerCase().trim();
-      if (!q) return [];
-      const matchQ = ftsPhrase(q);
-      const out = [];
-      try {
-        const rows = db.prepare("SELECT id FROM node_fts WHERE node_fts MATCH ? LIMIT ?").all(matchQ, limit);
-        for (const r of rows) {
-          const cps = db.prepare("SELECT c.summary FROM checkpoints c JOIN checkpoint_nodes cn ON cn.session_id=c.session_id AND cn.seq_start=c.seq_start WHERE cn.node_id=? ORDER BY c.created_at DESC LIMIT 1").all(r.id);
-          if (cps.length) out.push({ node: r.id, summary: cps[0].summary, score: 1 });
-        }
-      } catch {
+      const rows = db.prepare("SELECT id FROM node_fts WHERE node_fts MATCH ? LIMIT ?").all(matchQ, limit);
+      for (const r of rows) {
+        const cps = db.prepare("SELECT c.summary FROM checkpoints c JOIN checkpoint_nodes cn ON cn.session_id=c.session_id AND cn.seq_start=c.seq_start WHERE cn.node_id=? ORDER BY c.created_at DESC LIMIT 1").all(r.id);
+        if (cps.length) out.push({ node: r.id, summary: cps[0].summary, score: 1 });
       }
-      try {
-        const cps = db.prepare("SELECT session_id, seq_start, summary FROM cp_fts WHERE cp_fts MATCH ? LIMIT ?").all(matchQ, limit);
-        for (const c of cps) out.push({ node: "cp:" + c.session_id + ":" + c.seq_start, summary: c.summary, score: 0.8 });
-      } catch {
-      }
-      const seen = /* @__PURE__ */ new Set();
-      const dedup = [];
-      for (const o of out) {
-        if (!seen.has(o.node)) {
-          seen.add(o.node);
-          dedup.push(o);
-        }
-      }
-      return dedup.slice(0, limit);
-    } finally {
-      db.close();
+    } catch {
     }
-  } catch (err) {
-    warn("ACP recall failed", err);
+    try {
+      const cps = db.prepare("SELECT session_id, seq_start, summary FROM cp_fts WHERE cp_fts MATCH ? LIMIT ?").all(matchQ, limit);
+      for (const c of cps) out.push({ node: "cp:" + c.session_id + ":" + c.seq_start, summary: c.summary, score: 0.8 });
+    } catch {
+    }
+    const seen = /* @__PURE__ */ new Set();
+    const dedup = [];
+    for (const o of out) {
+      if (!seen.has(o.node)) {
+        seen.add(o.node);
+        dedup.push(o);
+      }
+    }
+    return dedup.slice(0, limit);
+  });
+}
+
+// src/acp.ts
+var lastProblem = null;
+function note(detail, status) {
+  lastProblem = { detail, status };
+  if (status.reason === "no-db") return;
+  console.warn("[dsh-research-lab] ACP graph read failed:", detail, `(reason=${status.reason})`);
+}
+function acpGraphAvailable() {
+  return acpGraphStatus().ok;
+}
+function acpGraphRecall2(query, limit = 4) {
+  const r = acpGraphRecall(query, limit);
+  if (!r.ok) {
+    note(r.detail, r.status);
     return [];
   }
+  lastProblem = null;
+  return r.value;
 }
 
 // src/rewrite.ts
@@ -1173,7 +1282,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
     }
   };
   count(dir);
-  const note = [
+  const note2 = [
     "# Ref study: " + repo,
     "",
     "source: https://github.com/" + repo + "  |  cloned: " + (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
@@ -1205,7 +1314,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
     ""
   ];
   const noteFile = path4.join(dir, "REF.md");
-  fs4.writeFileSync(noteFile, note.join("\n"), "utf8");
+  fs4.writeFileSync(noteFile, note2.join("\n"), "utf8");
   return { repo, dir, readme, claudeMd, tree, files, noteFile };
 }
 
@@ -2033,7 +2142,7 @@ async function apply(ctx) {
           const hits = search(project, q, k);
           let acpBlock = "";
           if (acpGraphAvailable()) {
-            const acp = acpGraphRecall(q, 3);
+            const acp = acpGraphRecall2(q, 3);
             if (acp.length) acpBlock = "\n\n## ACP \u8DE8\u4F1A\u8BDD\u8BB0\u5FC6 (acp_graph)\n" + acp.map((h) => "\u2022 [" + h.node + "] " + h.summary.slice(0, 180)).join("\n");
           }
           if (!hits.length) return "No hits for: " + q + "\nTry expand (iterative keyword mining) or add more docs." + acpBlock;
