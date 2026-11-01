@@ -87,6 +87,20 @@ export interface IndexInfo {
     semantics?: Record<string, unknown>;
     service: string;
     version: string;
+    /**
+     * 原始 `Info` 回應，原樣保留。
+     *
+     * 為什麼需要：上面那些欄位是**白名單**。伺服器新增的欄位會被這個解析器靜默丟掉，
+     * 於是「對方加了能力」在客戶端看起來跟「對方沒加」一模一樣。
+     *
+     * 2026-11-02 實測：GAS 在 `Info` 加了 `compat` / `where` / `truthStatus`，
+     * 其中 `where` 就是**為了讓客戶端不必硬寫路徑**而存在的索引——而我的檢查一路讀到
+     * `undefined`，差點回報「你沒部署」。真相是：欄位在，是我把它丟了。
+     *
+     * 白名單本身沒有錯（型別穩定、呼叫方好寫），錯的是**只**給白名單。
+     * 合約的版本是**下界**，客戶端永遠會有它不認識的欄位；留一份原樣，新能力才有可能被發現。
+     */
+    raw: Record<string, unknown>;
 }
 export interface IndexDocument {
     id: string;
@@ -128,7 +142,8 @@ export interface IndexHit {
     snippetTruncated: boolean;
     /** 最高分區塊在該文件中的序號。 */
     bestChunkOrdinal?: number;
-    /** 最高單一區塊分數。`score` 在 `docAggregation:"max"` 時等於它、`"sum"` 時不是。 */
+    /** 最高單一區塊分數。`score` 只在 `docAggregation:"max"` 時等於它；
+     *  `"sum"` 與 `"mean"` 下都不是（sum 是所有命中塊之和、mean 是它們的均值）。 */
     bestChunkScore?: number;
     /** 這份文件被切成幾塊（長度偏誤的來源，呼叫方要自己看）。 */
     chunkCount?: number;
@@ -205,8 +220,12 @@ export declare function searchIndex(env: CapIndexEnv, namespace: string, query: 
     syntax?: 'PLAIN' | 'TERMS';
     /** `doc` ＝ 回文件級排序（一個 docId 一條）。預設 `chunk`。 */
     groupBy?: 'chunk' | 'doc';
-    /** 只在 `groupBy:"doc"` 有意義：`max`（預設語意）或 `sum`。 */
-    docAggregation?: 'max' | 'sum';
+    /** 只在 `groupBy:"doc"` 有意義：`max` / `sum` / `mean`。
+     *
+     *  **不要在客戶端假設伺服器預設值。** 回應會回顯這次實際生效的 `docAggregation`，
+     *  以回顯為準（2026-11-01 的實驗裡這三種在 11 題上有 6/4/1 的勝場分布，
+     *  `mean` 對 `max` 顯著較好，但 `mean` 與 `sum` 分不開——它們量的是不同的問題）。 */
+    docAggregation?: 'max' | 'sum' | 'mean';
     timeoutMs?: number;
 }): Promise<SearchOutcome | Failure>;
 /** 命名空間現況。搜尋前先用它回答「這裡到底有沒有東西」。 */

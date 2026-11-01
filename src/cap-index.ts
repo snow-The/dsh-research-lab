@@ -117,6 +117,20 @@ export interface IndexInfo {
   semantics?: Record<string, unknown>
   service: string
   version: string
+  /**
+   * 原始 `Info` 回應，原樣保留。
+   *
+   * 為什麼需要：上面那些欄位是**白名單**。伺服器新增的欄位會被這個解析器靜默丟掉，
+   * 於是「對方加了能力」在客戶端看起來跟「對方沒加」一模一樣。
+   *
+   * 2026-11-02 實測：GAS 在 `Info` 加了 `compat` / `where` / `truthStatus`，
+   * 其中 `where` 就是**為了讓客戶端不必硬寫路徑**而存在的索引——而我的檢查一路讀到
+   * `undefined`，差點回報「你沒部署」。真相是：欄位在，是我把它丟了。
+   *
+   * 白名單本身沒有錯（型別穩定、呼叫方好寫），錯的是**只**給白名單。
+   * 合約的版本是**下界**，客戶端永遠會有它不認識的欄位；留一份原樣，新能力才有可能被發現。
+   */
+  raw: Record<string, unknown>
 }
 
 export interface IndexDocument {
@@ -381,6 +395,7 @@ export async function probeIndex(env: CapIndexEnv, timeoutMs = DEFAULT_TIMEOUT_M
       maxDocumentsPerIngest: asNumber(body.maxDocumentsPerIngest),
       maxLimit: asNumber(body.maxLimit),
       maxTextBytesPerDocument: asNumber(body.maxTextBytesPerDocument),
+      raw: body,
       ...(body.semantics !== undefined && body.semantics !== null ? { semantics: asRecord(body.semantics) } : {}),
       service: asString(body.service),
       version: asString(body.version),

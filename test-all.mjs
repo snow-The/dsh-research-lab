@@ -1287,6 +1287,7 @@ async function probeIndex(env, timeoutMs = DEFAULT_TIMEOUT_MS) {
       maxDocumentsPerIngest: asNumber(body.maxDocumentsPerIngest),
       maxLimit: asNumber(body.maxLimit),
       maxTextBytesPerDocument: asNumber(body.maxTextBytesPerDocument),
+      raw: body,
       ...body.semantics !== void 0 && body.semantics !== null ? { semantics: asRecord(body.semantics) } : {},
       service: asString(body.service),
       version: asString(body.version)

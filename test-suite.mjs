@@ -134,6 +134,23 @@ const okInfo = { capabilities: ['index:fts5'], chunker: 'para-v1', contractVersi
   await d.stop();
 }
 
+// 8b1b. 伺服器新增了客戶端不認識的欄位 → 必須保留在 raw 裡，不能被白名單吞掉
+//
+//     2026-11-02 的實例：GAS 在 Info 加了 compat / where / truthStatus，
+//     其中 where 就是「讓客戶端不必硬寫路徑」的索引。白名單把它們全丟了，
+//     於是客戶端看到的是一個看起來很正常、但少了新能力的 Info——而且沒有任何提示。
+//     這條測試用一台**多送一個未知欄位**的假伺服器把這件事釘住。
+{
+  const d = await fakeDaemon({
+    Info: () => [200, { ...okInfo, compat: { minCompatible: { 'dsh.v1.Index': 6 } }, where: { truthStatus: 'a.b' } }],
+  });
+  const probe = await rel.probeIndex(envOf(d.port));
+  ok('unknown Info fields survive in info.raw', probe.available === true && probe.info.raw?.compat?.minCompatible?.['dsh.v1.Index'] === 6, JSON.stringify(probe.info?.raw ?? null).slice(0, 200));
+  ok('and the pointer index is reachable', probe.available === true && probe.info.raw?.where?.truthStatus === 'a.b', JSON.stringify(probe.info?.raw ?? null).slice(0, 200));
+  ok('the normalised view still works unchanged', probe.available === true && probe.info.contractVersion === 1 && probe.info.chunker === 'para-v1', JSON.stringify(probe.info ?? null).slice(0, 160));
+  await d.stop();
+}
+
 // 8c. 有服務但拒絕 → UNAUTHORIZED，且不能講成「服務不存在」
 {
   const d = await fakeDaemon({ Info: () => [401, { error: { code: 'UNAUTHORIZED', message: 'UNAUTHORIZED' } }] });
