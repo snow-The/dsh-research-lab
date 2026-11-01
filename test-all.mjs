@@ -1138,7 +1138,8 @@ function renderScoop(a) {
 import { readFileSync as readFileSync6 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join6 } from "node:path";
-var EXPECTED_CONTRACT_VERSION = 1;
+var MIN_CONTRACT_VERSION = 1;
+var EXPECTED_CONTRACT_VERSION = MIN_CONTRACT_VERSION;
 var SERVICE = "dsh.v1.Index";
 var DEFAULT_TIMEOUT_MS = 15e3;
 function resolveEnv(opts = {}) {
@@ -1267,12 +1268,12 @@ async function probeIndex(env, timeoutMs = DEFAULT_TIMEOUT_MS) {
   }
   const body = asRecord(outcome.body);
   const contractVersion = asNumber(body.contractVersion, -1);
-  if (contractVersion !== EXPECTED_CONTRACT_VERSION) {
+  if (contractVersion < MIN_CONTRACT_VERSION) {
     return {
       available: false,
       code: "CONTRACT_MISMATCH",
-      detail: { client: EXPECTED_CONTRACT_VERSION, server: contractVersion },
-      message: `contract mismatch: this client speaks v${EXPECTED_CONTRACT_VERSION}, the daemon implements v${contractVersion}`
+      detail: { client: MIN_CONTRACT_VERSION, server: contractVersion },
+      message: `contract too old: this client needs v${MIN_CONTRACT_VERSION}+, the daemon implements v${contractVersion}`
     };
   }
   return {
@@ -1430,7 +1431,7 @@ function describeAvailability(probe) {
     case "UNAUTHORIZED":
       return "Index \u5B58\u5728\u4F46\u62D2\u7D55\u9019\u6B21\u547C\u53EB\uFF08\u8EAB\u5206/\u6388\u6B0A\uFF09\u2014\u2014\u6AA2\u67E5\u7E3D\u7DDA token\uFF0C\u4E0D\u662F\u670D\u52D9\u4E0D\u5B58\u5728";
     case "CONTRACT_MISMATCH":
-      return `\u5951\u7D04\u7248\u672C\u4E0D\u7B26\uFF08\u5BA2\u6236\u7AEF v${EXPECTED_CONTRACT_VERSION}\uFF09\u2014\u2014\u62D2\u7D55\u57F7\u884C\uFF0C\u4E0D\u964D\u7D1A`;
+      return `\u5951\u7D04\u7248\u672C\u592A\u820A\uFF08\u5BA2\u6236\u7AEF\u9700\u8981 v${MIN_CONTRACT_VERSION}+\uFF09\u2014\u2014\u62D2\u7D55\u57F7\u884C\uFF0C\u4E0D\u964D\u7D1A`;
     case "UNAVAILABLE":
       return "\u9023\u4E0D\u4E0A daemon\uFF08\u6C92\u8DD1\u3001port \u6A94\u4E0D\u898B\u3001\u903E\u6642\uFF09\u2014\u2014\u5148\u78BA\u8A8D bus \u6D3B\u8457";
     case "NOT_IMPLEMENTED":
@@ -1443,6 +1444,7 @@ function describeAvailability(probe) {
 }
 export {
   EXPECTED_CONTRACT_VERSION,
+  MIN_CONTRACT_VERSION,
   absorbLedger,
   addClaims,
   addDoc,

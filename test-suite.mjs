@@ -114,12 +114,23 @@ const okInfo = { capabilities: ['index:fts5'], chunker: 'para-v1', contractVersi
   await d.stop();
 }
 
-// 8b. 服務在，但契約版本不同 → CONTRACT_MISMATCH，且兩個版本號都要露出
+// 8b. 服務端比較新（v2）→ 接受，並把它的版本號原樣露出
+//     2026-11-01 服務端把 groupBy:"doc" 的 score 從 sum 改成 max（1 → 2）。
+//     嚴格相等會讓每次 Index 呼叫都不可用，而本客戶端並不解釋 score，只轉述 semantics。
 {
   const d = await fakeDaemon({ Info: () => [200, { ...okInfo, contractVersion: 2 }] });
   const probe = await rel.probeIndex(envOf(d.port));
-  ok('version skew → CONTRACT_MISMATCH', probe.available === false && probe.code === 'CONTRACT_MISMATCH', JSON.stringify(probe));
-  ok('both versions are reported', probe.detail && probe.detail.client === 1 && probe.detail.server === 2, JSON.stringify(probe.detail));
+  ok('newer contract is accepted (single lower bound, no upper bound)', probe.available === true, JSON.stringify(probe));
+  ok('server contract version is reported verbatim', probe.available === true && probe.info.contractVersion === 2, JSON.stringify(probe.info && probe.info.contractVersion));
+  await d.stop();
+}
+
+// 8b2. 服務端比較舊（v0）→ 仍拒絕：舊端可能缺我們依賴的欄位，不猜、不降級
+{
+  const d = await fakeDaemon({ Info: () => [200, { ...okInfo, contractVersion: 0 }] });
+  const probe = await rel.probeIndex(envOf(d.port));
+  ok('older contract → CONTRACT_MISMATCH', probe.available === false && probe.code === 'CONTRACT_MISMATCH', JSON.stringify(probe));
+  ok('older contract reports both versions', probe.detail && probe.detail.client === 1 && probe.detail.server === 0, JSON.stringify(probe.detail));
   await d.stop();
 }
 

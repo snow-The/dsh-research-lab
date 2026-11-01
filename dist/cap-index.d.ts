@@ -16,7 +16,19 @@
  *   B. `UNCHANGED` 是結果，`FAILED` 是錯誤。前者不進錯誤通道。
  *   C. 不降級、不猜：契約版本不符就拒絕執行並回報兩個版本號。
  */
-/** 這個客戶端認得的契約版本。服務端不同就拒絕。 */
+/**
+ * 這個客戶端依賴的**最低**契約版本（單一下界，無上界——與插件的 `engines.dsh: ">=0.2.1-rc.2"` 同一條規矩）。
+ *
+ * 為什麼不再要求「必須相等」：2026-11-01 服務端把 `groupBy:"doc"` 的 score 從 sum 改成 max
+ * （語意變更，contractVersion 1 → 2）。嚴格相等讓**每一次** Index 呼叫都變成 CONTRACT_MISMATCH，
+ * 而這個客戶端根本不解釋 score——它只把 `semantics` 原樣轉述給呼叫方。用嚴格相等去擋一個
+ * 自己不消費的欄位，換來的只是全面不可用。
+ *
+ * 規則：`server < MIN` 拒絕（舊服務端可能缺我們依賴的欄位）；`server >= MIN` 接受，
+ * 並把兩邊版本都留在 `info.contractVersion` 與失敗訊息裡，讓呼叫方自己判斷要不要用新語意。
+ */
+export declare const MIN_CONTRACT_VERSION = 1;
+/** @deprecated 舊名，保留以免呼叫方斷裂；語意已從「必須相等」改為「最低版本」。 */
 export declare const EXPECTED_CONTRACT_VERSION = 1;
 export interface CapIndexEnv {
     baseUrl: string;
