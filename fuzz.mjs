@@ -1,6 +1,8 @@
-import * as rel from 'file:///C:/Users/snow/.dsh-starter/plugins/dsh-research-lab/test-all.mjs';
+const rel = await import(new URL('./test-all.mjs', import.meta.url).href);
+import { tmpdir } from 'node:os';
+import { join as pjoin } from 'node:path';
 import * as fs from 'node:fs';
-const PROJ = 'C:/Users/snow/AppData/Local/Temp/rlab-fuzz';
+const PROJ = process.env.RLAB_PROJ ?? pjoin(tmpdir(), 'rlab-fuzz');
 fs.rmSync(PROJ, { recursive: true, force: true });
 for (const [t, b] of [['A', 'alpha beta gamma'], ['B', '中文测试 蒸馏 塌缩'], ['C', 'we propose method X for task Y']]) rel.addDoc(PROJ, t, b, 'fuzz');
 const CTL0 = String.fromCharCode(0), CTL1 = String.fromCharCode(1), CTL127 = String.fromCharCode(127), CTL8203 = String.fromCharCode(8203), CTL8232 = String.fromCharCode(8232), CTL65535 = String.fromCharCode(65535);

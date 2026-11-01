@@ -1,9 +1,11 @@
 
-import * as rel from 'file:///C:/Users/snow/.dsh-starter/plugins/dsh-research-lab/test-all.mjs';
+const rel = await import(new URL('./test-all.mjs', import.meta.url).href);
+import { tmpdir } from 'node:os';
+import { join as pjoin } from 'node:path';
 import * as fs from 'node:fs';
 let pass = 0, fail = 0;
 const ok = (name, cond, detail = '') => { if (cond) { pass++; console.log('  ✅ ' + name); } else { fail++; console.log('  ❌ ' + name + (detail ? ' — ' + detail : '')); } };
-const PROJ = 'C:/Users/snow/AppData/Local/Temp/rlab-t4';
+const PROJ = process.env.RLAB_PROJ ?? pjoin(tmpdir(), 'rlab-t4');
 fs.rmSync(PROJ, { recursive: true, force: true });
 
 console.log('== 1. rlab_related: FTS5 + BM25 hybrid + expand ==');

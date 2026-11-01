@@ -1,7 +1,8 @@
 
-import * as rel from 'file:///C:/Users/snow/.dsh-starter/plugins/dsh-research-lab/test-all.mjs';
+const rel = await import(new URL('./test-all.mjs', import.meta.url).href);
+import { homedir } from 'node:os';
 import * as fs from 'node:fs';
-const PROJ = 'C:/Users/snow';  // gal2vec project root (wiki files live here)
+const PROJ = process.env.GAL2VEC_ROOT ?? homedir();  // gal2vec project root (wiki files live here)
 fs.rmSync(PROJ + '/.rlab', { recursive: true, force: true });  // idempotent reruns
 const line = s => console.log('\n' + '='.repeat(60) + '\n' + s + '\n' + '='.repeat(60));
 
