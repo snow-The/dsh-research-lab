@@ -78,5 +78,260 @@ ok('every step is still listed (nothing silently skipped)', ['Step 1', 'Step 2',
 ok('slug falls back to a hash for pure-CJK claims', /^scoop-[0-9a-f]{4,8}$/.test(rel.scoopSlug('一个中文主张')));
 ok('slug is deterministic', rel.scoopSlug('Fold at the hard limit') === rel.scoopSlug('Fold at the hard limit'));
 
+console.log('== 8. cap-index: dsh.v1.Index 客戶端（契約符合性） ==');
+// 這一段不是測我們的程式有沒有照自己想的跑，是測**三種失敗有沒有分得開**。
+// 合併任何兩種，呼叫方就會被送去修錯的東西——今天在 403 NO_GRANT 上剛付過代價。
+const { createServer } = await import('node:http');
+
+/** 起一個假 daemon；routes 決定每個 method 回什麼。 */
+async function fakeDaemon(routes) {
+  const server = createServer((req, res) => {
+    const method = req.url.split('/').pop();
+    const route = routes[method];
+    if (route === undefined) {
+      // 真的 Go mux 對不存在的路由回純文字，不是 JSON——客戶端必須靠這點判斷「服務不存在」。
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('404 page not found');
+      return;
+    }
+    const [status, body] = route(req);
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { port: server.address().port, stop: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+const envOf = (port) => ({ baseUrl: `http://127.0.0.1:${port}`, source: 'test', token: 'test-token' });
+const okInfo = { capabilities: ['index:fts5'], chunker: 'para-v1', contractVersion: 1, indexVersion: 1, service: 'dsh.v1.Index', version: '1' };
+
+// 8a. 服務根本不存在 → SERVICE_ABSENT（不是 UNAUTHORIZED，也不是 UNAVAILABLE）
+{
+  const d = await fakeDaemon({});
+  const probe = await rel.probeIndex(envOf(d.port));
+  ok('absent service → SERVICE_ABSENT', probe.available === false && probe.code === 'SERVICE_ABSENT', JSON.stringify(probe));
+  ok('absent service tells you to find the implementer, not retry', /not implemented|還沒有 Index/.test(rel.describeAvailability(probe)), rel.describeAvailability(probe));
+  await d.stop();
+}
+
+// 8b. 服務在，但契約版本不同 → CONTRACT_MISMATCH，且兩個版本號都要露出
+{
+  const d = await fakeDaemon({ Info: () => [200, { ...okInfo, contractVersion: 2 }] });
+  const probe = await rel.probeIndex(envOf(d.port));
+  ok('version skew → CONTRACT_MISMATCH', probe.available === false && probe.code === 'CONTRACT_MISMATCH', JSON.stringify(probe));
+  ok('both versions are reported', probe.detail && probe.detail.client === 1 && probe.detail.server === 2, JSON.stringify(probe.detail));
+  await d.stop();
+}
+
+// 8c. 有服務但拒絕 → UNAUTHORIZED，且不能講成「服務不存在」
+{
+  const d = await fakeDaemon({ Info: () => [401, { error: { code: 'UNAUTHORIZED', message: 'UNAUTHORIZED' } }] });
+  const probe = await rel.probeIndex(envOf(d.port));
+  ok('authorization failure → UNAUTHORIZED', probe.available === false && probe.code === 'UNAUTHORIZED', JSON.stringify(probe));
+  ok('authorization failure is not called absent', /身分|授權/.test(rel.describeAvailability(probe)), rel.describeAvailability(probe));
+  await d.stop();
+}
+
+// 8d. 連不上 → UNAVAILABLE（與 absent 分開：一個該等，一個該找人）
+{
+  const probe = await rel.probeIndex({ baseUrl: 'http://127.0.0.1:9', source: 'test', token: '' }, 800);
+  ok('connection failure → UNAVAILABLE', probe.available === false && probe.code === 'UNAVAILABLE', JSON.stringify(probe));
+}
+
+// 8e. Ingest：UNCHANGED 與 FAILED 必須是兩個狀態，不能併成一個 ok
+{
+  const d = await fakeDaemon({
+    Ingest: () => [200, {
+      documents: [
+        { chunks: 2, id: 'a.md', status: 'INDEXED', textBytes: 40 },
+        { chunks: 0, error: '', id: 'b.md', status: 'UNCHANGED', textBytes: 40 },
+        { chunks: 0, error: 'disk full', id: 'c.md', status: 'FAILED', textBytes: 0 },
+      ],
+      failed: 1, indexVersion: 1, indexed: 1, rejected: 0, unchanged: 1,
+    }],
+  });
+  const out = await rel.ingestDocuments(envOf(d.port), 'demo', [{ contentSha256: 'x', id: 'a.md', text: 'x' }]);
+  const byId = Object.fromEntries((out.documents || []).map((x) => [x.id, x.status]));
+  ok('unchanged survives as its own status', out.ok === true && byId['b.md'] === 'UNCHANGED', JSON.stringify(byId));
+  ok('failed stays distinguishable from unchanged', byId['c.md'] === 'FAILED' && out.failed === 1, JSON.stringify(byId));
+  ok('per-document error text is kept', (out.documents || []).find((x) => x.id === 'c.md')?.error === 'disk full');
+  await d.stop();
+}
+
+// 8f. Search：三種狀態要分得開（hits / no-hits / not-indexed）
+{
+  const mk = (payload) => fakeDaemon({ Search: () => [200, payload] });
+  const base = { chunker: 'para-v1', durationMs: 3, indexVersion: 1, normalizedQuery: 'q' };
+
+  const d1 = await mk({ ...base, hits: [{ chunkOrdinal: 0, docId: 'a.md', score: 1.5, snippet: '量綱', snippetTruncated: false }], matchedDocuments: 1, namespaceDocuments: 5 });
+  const h = await rel.searchIndex(envOf(d1.port), 'demo', '量綱');
+  ok('hits → state=hits', h.ok === true && h.state === 'hits' && h.hits.length === 1, JSON.stringify(h).slice(0, 120));
+  await d1.stop();
+
+  const d2 = await mk({ ...base, hits: [], matchedDocuments: 0, namespaceDocuments: 5 });
+  const n = await rel.searchIndex(envOf(d2.port), 'demo', '查無此字');
+  ok('indexed but nothing matched → state=no-hits', n.ok === true && n.state === 'no-hits', String(n.state));
+  await d2.stop();
+
+  const d3 = await mk({ ...base, hits: [], matchedDocuments: 0, namespaceDocuments: 0 });
+  const e = await rel.searchIndex(envOf(d3.port), 'demo', '查無此字');
+  ok('never indexed → state=not-indexed (a different remedy)', e.ok === true && e.state === 'not-indexed', String(e.state));
+  await d3.stop();
+}
+
+// 8g. 空 namespace 在本地就拒絕：不要讓呼叫方的 bug 變成基礎設施故障
+{
+  const out = await rel.ingestDocuments({ baseUrl: 'http://127.0.0.1:9', source: 'test', token: '' }, '  ', [{ contentSha256: 'x', id: 'a', text: 'x' }]);
+  ok('empty namespace is rejected locally', out.ok === false && out.code === 'INVALID_REQUEST', JSON.stringify(out));
+  const q = await rel.searchIndex({ baseUrl: 'http://127.0.0.1:9', source: 'test', token: '' }, '', 'x');
+  ok('empty namespace on search is rejected locally too', q.ok === false && q.code === 'INVALID_REQUEST', JSON.stringify(q));
+}
+
+// 8h. 501 = 實作者說「這個方法還沒做」。不能讀成「服務不存在」，也不能讀成「回應壞了」。
+//     （GAS 真的用 501 表達 Delete 第二批；若這裡讀錯，人會去修一個沒壞的東西。）
+{
+  const d = await fakeDaemon({ Delete: () => [501, { error: { code: 'NOT_IMPLEMENTED', message: 'Delete is the second batch' } }] });
+  const out = await rel.deleteDocuments(envOf(d.port), 'demo', { docIds: ['a.md'] });
+  ok('501 → NOT_IMPLEMENTED', out.ok === false && out.code === 'NOT_IMPLEMENTED', JSON.stringify(out).slice(0, 140));
+  ok('501 is not reported as absent', /還沒實作/.test(rel.describeAvailability(out)), rel.describeAvailability(out));
+  await d.stop();
+}
+
+// 8i. Delete 的成功路徑：契約回「刪了幾個」也回「還剩什麼」，兩個都要照抄，不要自己補 notFound
+{
+  const d = await fakeDaemon({
+    Delete: () => [200, {
+      deletedChunks: 3, deletedDocuments: 2, dryRun: false, durationMs: 4,
+      indexVersion: 3, namespace: 'demo', remainingChunks: 7, remainingDocuments: 5,
+    }],
+  });
+  const out = await rel.deleteDocuments(envOf(d.port), 'demo', { docIds: ['a.md', 'b.md'] });
+  ok(
+    'delete reports counts and what remains',
+    out.ok === true && out.deletedDocuments === 2 && out.remainingDocuments === 5 && out.remainingChunks === 7,
+    JSON.stringify(out),
+  );
+  ok('delete echoes the namespace and indexVersion it ran against', out.namespace === 'demo' && out.indexVersion === 3, JSON.stringify(out));
+  await d.stop();
+}
+
+// 8j. **送出去的欄位名**必須與線上同名：`docIds` / `all`，而且**不得**送 `ids`。
+//     真實 daemon 對 `ids` 回 400「要刪什麼？」——一個欄位兩個名字，下一個人就會送錯。
+{
+  const seen = [];
+  const capture = (req) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk });
+    req.on('end', () => seen.push(JSON.parse(raw)));
+  };
+  const d = await fakeDaemon({
+    Delete: (req) => {
+      capture(req);
+      return [200, { deletedChunks: 0, deletedDocuments: 0, dryRun: false, indexVersion: 3, namespace: 'demo', remainingChunks: 0, remainingDocuments: 0 }];
+    },
+  });
+
+  await rel.deleteDocuments(envOf(d.port), 'demo', { docIds: ['a.md'] });
+  await rel.deleteDocuments(envOf(d.port), 'demo', { all: true });
+  await rel.deleteDocuments(envOf(d.port), 'demo', { docIds: ['a.md'], dryRun: true });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await d.stop();
+
+  ok('wire: first call sends docIds and never ids', seen[0]?.docIds?.[0] === 'a.md' && !('ids' in (seen[0] ?? {})), JSON.stringify(seen[0]));
+  ok('wire: all=true is its own field, not a flag on docIds', seen[1]?.all === true && !('docIds' in (seen[1] ?? {})), JSON.stringify(seen[1]));
+  ok('wire: dryRun is forwarded', seen[2]?.dryRun === true, JSON.stringify(seen[2]));
+}
+
+// 8k. 矛盾與空目標都在本地就被擋：連請求都不發
+{
+  const d = await fakeDaemon({ Delete: () => [200, { deletedChunks: 0, deletedDocuments: 0 }] });
+  const both = await rel.deleteDocuments(envOf(d.port), 'demo', { docIds: ['a'], all: true });
+  ok('docIds + all is rejected locally', both.ok === false && both.code === 'INVALID_REQUEST', JSON.stringify(both));
+  const neither = await rel.deleteDocuments(envOf(d.port), 'demo', {});
+  ok(
+    'no target at all is rejected locally ("no target" is not "delete everything")',
+    neither.ok === false && neither.code === 'INVALID_REQUEST' && /all=true/.test(neither.message),
+    JSON.stringify(neither),
+  );
+  const emptyNs = await rel.deleteDocuments(envOf(d.port), '  ', { all: true });
+  ok('empty namespace is rejected locally', emptyNs.ok === false && emptyNs.code === 'INVALID_REQUEST', JSON.stringify(emptyNs));
+  await d.stop();
+}
+
+// 8l. 伺服器對舊名 `ids` 的 400，客戶端必須把**伺服器說的原因**帶出來。
+//     「answered 400」不夠：那讓「我送錯欄位」與「伺服器吐了垃圾」長得一樣，
+//     而 400 幾乎總是在說前者。
+{
+  const d = await fakeDaemon({
+    Delete: () => [400, { error: { code: 'INVALID_ENVELOPE', message: 'INVALID_ENVELOPE: 要刪什麼？給 docIds，或 all=true' } }],
+  });
+  const out = await rel.deleteDocuments(envOf(d.port), 'demo', { docIds: ['a.md'] });
+  ok(
+    'a 400 surfaces the server code and message, not just "answered 400"',
+    out.ok === false && out.code === 'BAD_RESPONSE' && /INVALID_ENVELOPE/.test(out.message) && /要刪什麼/.test(out.message),
+    JSON.stringify(out).slice(0, 200),
+  );
+  await d.stop();
+}
+
+// 8m. `Info.semantics` 原樣帶過來：語意住在契約裡，客戶端不讀實作方的 README
+{
+  const semantics = {
+    search: { limit: { default: 10, max: 100 }, ordering: 'score 降序；同分以 (docId, chunkOrdinal) 決勝', groupBy: 'chunk | doc' },
+    delete: { target: 'docIds 或 all=true；空請求是 400' },
+  };
+  const d = await fakeDaemon({ Info: () => [200, { ...okInfo, semantics }] });
+  const probe = await rel.probeIndex(envOf(d.port));
+  ok(
+    'Info.semantics is preserved, not dropped',
+    probe.available === true && probe.info.semantics?.search?.limit?.max === 100,
+    JSON.stringify(probe).slice(0, 200),
+  );
+  ok(
+    'the meaning of limit is readable without any README',
+    probe.available === true && /降序/.test(String(probe.info.semantics?.search?.ordering ?? '')),
+    JSON.stringify(probe.info?.semantics ?? null).slice(0, 200),
+  );
+  await d.stop();
+}
+
+// 8n. 伺服器回報「我實際用了什麼」——要求 500 卻只回 100 筆時，呼叫方要能看出是夾鉗
+{
+  const seen = [];
+  const d = await fakeDaemon({
+    Search: (req) => {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk });
+      req.on('end', () => seen.push(JSON.parse(raw)));
+      return [200, {
+        candidatesTruncated: true,
+        chunker: 'gas-index-text-v2',
+        durationMs: 2,
+        groupBy: 'doc',
+        hits: [{ chunkOrdinal: 0, docId: 'd1', kind: '', labels: {}, score: 0.7, snippet: '門鈴響了', snippetTruncated: false }],
+        indexVersion: 3,
+        limit: 100,
+        matchedDocuments: 1,
+        namespaceDocuments: 2,
+        normalizedQuery: '門鈴',
+        order: 'newest',
+        returned: 1,
+        staleDocuments: 2,
+      }];
+    },
+  });
+  const out = await rel.searchIndex(envOf(d.port), 'demo', '門鈴', { limit: 500 });
+  ok(
+    'the effective limit comes from the server, not from what we asked for',
+    out.ok === true && out.limit === 100,
+    JSON.stringify({ limit: out.limit, returned: out.returned }),
+  );
+  ok('returned / order / groupBy are surfaced', out.returned === 1 && out.order === 'newest' && out.groupBy === 'doc', JSON.stringify({ groupBy: out.groupBy, order: out.order, returned: out.returned }));
+  ok('truncation and staleness are visible, not silent', out.candidatesTruncated === true && out.staleDocuments === 2, JSON.stringify({ stale: out.staleDocuments, truncated: out.candidatesTruncated }));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  ok('we still send the caller’s request; the server owns clamping', seen[0]?.limit === 500, JSON.stringify(seen[0] ?? null).slice(0, 120));
+  await d.stop();
+}
+
 console.log('\n===== RESULT: ' + pass + ' passed / ' + fail + ' failed =====');
 process.exit(fail ? 1 : 0);

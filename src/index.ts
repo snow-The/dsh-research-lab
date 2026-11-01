@@ -27,6 +27,7 @@ import { addClaims, betaConfidence, citeClaim, claimsReport, extractClaims, load
 import { suggestExternal, suggestZh } from './suggest.js';
 import { cloneAndStudy } from './ref.js';
 import * as os from 'node:os';
+import { describeAvailability, probeIndex, resolveEnv } from './cap-index.js';
 import { OCR_MODELS, fetchOcrMarkdown, ocrToken, runOcr, type OcrModel } from './ocr.js';
 
 const textOut = { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] };
@@ -800,6 +801,20 @@ export async function apply(ctx: any) {
         for (const t of todoPages) lines.push('- ' + t.title + '  (' + t.id + ')');
         lines.push('');
       }
+      // 能力層現況：這一行存在的理由，是讓「Index 有沒有上線」變成每次看狀態都會
+      // 順便看到的事，而不是要有人記得去探測。它**不改變任何既有行為**——搜尋仍走
+      // 本地 FTS5，直到有人明確把 related.ts 切過去。
+      // 逾時刻意壓到 1.5 秒：狀態查詢不該被一個沒開的服務拖住。
+      lines.push('');
+      lines.push('## Capability: dsh.v1.Index');
+      try {
+        const probe = await probeIndex(resolveEnv(), 1500);
+        lines.push('- ' + describeAvailability(probe));
+      } catch (error) {
+        // 探測自己壞掉也要講出來，不要讓狀態看起來一切正常。
+        lines.push('- 探測失敗：' + (error instanceof Error ? error.message : String(error)));
+      }
+      lines.push('');
       lines.push('_State dir: ' + dir + '_');
       return lines.join('\n');
     },

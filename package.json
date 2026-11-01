@@ -56,6 +56,6 @@
     "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1"
   },
   "engines": {
-    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+    "dsh": ">=0.2.1-rc.2"
   }
 }

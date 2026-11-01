@@ -1321,6 +1321,185 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
 // src/index.ts
 import * as os2 from "node:os";
 
+// src/cap-index.ts
+import { readFileSync as readFileSync6 } from "node:fs";
+import { homedir as homedir3 } from "node:os";
+import { join as join7 } from "node:path";
+var EXPECTED_CONTRACT_VERSION = 1;
+var SERVICE = "dsh.v1.Index";
+var DEFAULT_TIMEOUT_MS = 15e3;
+function resolveEnv(opts = {}) {
+  const dshHome = opts.dshHome ?? join7(homedir3(), ".dsh");
+  const busDir = join7(dshHome, "session-bus");
+  const read = (file) => {
+    try {
+      return readFileSync6(join7(busDir, file), "utf8").trim();
+    } catch {
+      return "";
+    }
+  };
+  let baseUrl = opts.baseUrl ?? process.env.DSH_CAP_URL ?? "";
+  if (baseUrl === "") {
+    const port = read("port");
+    baseUrl = /^\d+$/.test(port) ? `http://127.0.0.1:${port}` : "";
+  }
+  return { baseUrl, source: baseUrl === "" ? "unresolved" : baseUrl, token: read("token") };
+}
+async function call(env, method, payload, timeoutMs) {
+  if (env.baseUrl === "") {
+    return {
+      body: null,
+      failure: {
+        code: "UNAVAILABLE",
+        message: "cannot locate the capability daemon: no port file under ~/.dsh/session-bus and no DSH_CAP_URL",
+        ok: false
+      },
+      status: 0
+    };
+  }
+  const headers = { "connect-protocol-version": "1", "content-type": "application/json" };
+  if (env.token !== "") headers.authorization = `Bearer ${env.token}`;
+  let response;
+  try {
+    response = await fetch(`${env.baseUrl}/${SERVICE}/${method}`, {
+      body: JSON.stringify(payload),
+      headers,
+      method: "POST",
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { body: null, failure: { code: "UNAVAILABLE", message: `cannot reach ${env.baseUrl}: ${message}`, ok: false }, status: 0 };
+  }
+  const text = await response.text();
+  let body = null;
+  try {
+    body = text === "" ? null : JSON.parse(text);
+  } catch {
+    if (response.status === 404) {
+      return {
+        body: null,
+        failure: {
+          code: "SERVICE_ABSENT",
+          message: `${SERVICE} is not implemented on this daemon (404 for ${method}); nothing to degrade from \u2014 the service simply is not there`,
+          ok: false
+        },
+        status: 404
+      };
+    }
+    return {
+      body: null,
+      failure: { code: "BAD_RESPONSE", message: `non-JSON reply (${response.status}) from ${SERVICE}/${method}: ${text.slice(0, 160)}`, ok: false },
+      status: response.status
+    };
+  }
+  if (response.status === 401 || response.status === 403) {
+    const serverCode = body?.error?.code;
+    return {
+      body,
+      failure: {
+        code: "UNAUTHORIZED",
+        message: `daemon rejected the call (${response.status}${typeof serverCode === "string" ? ` ${serverCode}` : ""}) \u2014 this is an identity/authorization problem, not a missing service`,
+        ok: false
+      },
+      status: response.status
+    };
+  }
+  if (response.status === 404) {
+    return {
+      body,
+      failure: { code: "SERVICE_ABSENT", message: `${SERVICE} is not implemented on this daemon (404 for ${method})`, ok: false },
+      status: 404
+    };
+  }
+  if (response.status === 501) {
+    const serverCode = body?.error?.code;
+    const serverMessage = body?.error?.message;
+    return {
+      body,
+      failure: {
+        code: "NOT_IMPLEMENTED",
+        message: `${SERVICE}/${method} is not implemented yet (501${typeof serverCode === "string" ? ` ${serverCode}` : ""})${typeof serverMessage === "string" ? `: ${serverMessage}` : ""}`,
+        ok: false
+      },
+      status: 501
+    };
+  }
+  if (!response.ok) {
+    const errorBody = body?.error ?? void 0;
+    const serverCode = typeof errorBody?.code === "string" ? errorBody.code : "";
+    const serverMessage = typeof errorBody?.message === "string" ? errorBody.message : "";
+    return {
+      body,
+      failure: {
+        code: "BAD_RESPONSE",
+        message: `${SERVICE}/${method} answered ${response.status}${serverCode === "" ? "" : ` ${serverCode}`}${serverMessage === "" ? "" : `: ${serverMessage}`}`,
+        ok: false
+      },
+      status: response.status
+    };
+  }
+  return { body, status: response.status };
+}
+var asRecord = (value) => typeof value === "object" && value !== null ? value : {};
+var asString = (value, fallback = "") => typeof value === "string" ? value : fallback;
+var asNumber = (value, fallback = 0) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
+var asArray = (value) => Array.isArray(value) ? value : [];
+async function probeIndex(env, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const outcome = await call(env, "Info", {}, timeoutMs);
+  if (outcome.failure !== void 0) {
+    const { code, message, detail } = outcome.failure;
+    return { available: false, code, message, ...detail === void 0 ? {} : { detail } };
+  }
+  const body = asRecord(outcome.body);
+  const contractVersion = asNumber(body.contractVersion, -1);
+  if (contractVersion !== EXPECTED_CONTRACT_VERSION) {
+    return {
+      available: false,
+      code: "CONTRACT_MISMATCH",
+      detail: { client: EXPECTED_CONTRACT_VERSION, server: contractVersion },
+      message: `contract mismatch: this client speaks v${EXPECTED_CONTRACT_VERSION}, the daemon implements v${contractVersion}`
+    };
+  }
+  return {
+    available: true,
+    info: {
+      capabilities: asArray(body.capabilities).filter((c) => typeof c === "string"),
+      chunker: asString(body.chunker),
+      contractVersion,
+      defaultLimit: asNumber(body.defaultLimit),
+      indexVersion: asNumber(body.indexVersion),
+      maxDocumentsPerIngest: asNumber(body.maxDocumentsPerIngest),
+      maxLimit: asNumber(body.maxLimit),
+      maxTextBytesPerDocument: asNumber(body.maxTextBytesPerDocument),
+      ...body.semantics !== void 0 && body.semantics !== null ? { semantics: asRecord(body.semantics) } : {},
+      service: asString(body.service),
+      version: asString(body.version)
+    }
+  };
+}
+function describeAvailability(probe) {
+  if (probe.available) {
+    return `${probe.info.service} v${probe.info.version} \xB7 contract v${probe.info.contractVersion} \xB7 chunker ${probe.info.chunker || "(unreported)"} \xB7 index v${probe.info.indexVersion}`;
+  }
+  switch (probe.code) {
+    case "SERVICE_ABSENT":
+      return "\u9019\u53F0 daemon \u9084\u6C92\u6709 Index \u670D\u52D9\uFF08\u8DEF\u7531\u4E0D\u5B58\u5728\uFF09\u2014\u2014\u627E\u5BE6\u4F5C\u8005\uFF0C\u4E0D\u8981\u63DB\u95DC\u9375\u5B57\u6216\u91CD\u8A66";
+    case "UNAUTHORIZED":
+      return "Index \u5B58\u5728\u4F46\u62D2\u7D55\u9019\u6B21\u547C\u53EB\uFF08\u8EAB\u5206/\u6388\u6B0A\uFF09\u2014\u2014\u6AA2\u67E5\u7E3D\u7DDA token\uFF0C\u4E0D\u662F\u670D\u52D9\u4E0D\u5B58\u5728";
+    case "CONTRACT_MISMATCH":
+      return `\u5951\u7D04\u7248\u672C\u4E0D\u7B26\uFF08\u5BA2\u6236\u7AEF v${EXPECTED_CONTRACT_VERSION}\uFF09\u2014\u2014\u62D2\u7D55\u57F7\u884C\uFF0C\u4E0D\u964D\u7D1A`;
+    case "UNAVAILABLE":
+      return "\u9023\u4E0D\u4E0A daemon\uFF08\u6C92\u8DD1\u3001port \u6A94\u4E0D\u898B\u3001\u903E\u6642\uFF09\u2014\u2014\u5148\u78BA\u8A8D bus \u6D3B\u8457";
+    case "NOT_IMPLEMENTED":
+      return "\u670D\u52D9\u5728\uFF0C\u4F46\u9019\u500B\u65B9\u6CD5\u9084\u6C92\u5BE6\u4F5C\uFF08\u5BE6\u4F5C\u65B9\u56DE 501\uFF09\u2014\u2014\u7167\u5B83\u7684\u6392\u7A0B\u7B49\uFF0C\u4E0D\u8981\u7576\u6210\u58DE\u6389";
+    case "INVALID_REQUEST":
+      return "\u8ACB\u6C42\u672C\u8EAB\u4E0D\u5408\u6CD5\u2014\u2014\u4FEE\u547C\u53EB\u65B9\uFF0C\u4E0D\u8981\u91CD\u8A66";
+    default:
+      return "\u670D\u52D9\u56DE\u61C9\u4E86\u4F46\u4E0D\u662F\u9810\u671F\u7684\u5F62\u72C0\u2014\u2014\u5148\u770B\u539F\u59CB\u56DE\u61C9";
+  }
+}
+
 // src/ocr.ts
 import * as fs5 from "node:fs";
 import * as os from "node:os";
@@ -2373,6 +2552,15 @@ async function apply(ctx) {
         for (const t of todoPages) lines.push("- " + t.title + "  (" + t.id + ")");
         lines.push("");
       }
+      lines.push("");
+      lines.push("## Capability: dsh.v1.Index");
+      try {
+        const probe = await probeIndex(resolveEnv(), 1500);
+        lines.push("- " + describeAvailability(probe));
+      } catch (error) {
+        lines.push("- \u63A2\u6E2C\u5931\u6557\uFF1A" + (error instanceof Error ? error.message : String(error)));
+      }
+      lines.push("");
       lines.push("_State dir: " + dir + "_");
       return lines.join("\n");
     }
