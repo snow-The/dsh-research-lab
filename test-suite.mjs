@@ -289,6 +289,37 @@ const okInfo = { capabilities: ['index:fts5'], chunker: 'para-v1', contractVersi
   ok('doc hit has no fabricated chunkOrdinal', !('chunkOrdinal' in h), JSON.stringify(h));
 }
 
+// 8o-b. "mean" 是三种聚合之一：新增的枚举值必须真的能送上線並被回顯。
+// 為什麼需要這一條：2026-11-01 的 per-query 實驗裡 mean 是勝場最多的那個（6/11，
+// 對 max 顯著、對 sum 不顯著），但客戶端的型別當時只寫了 'max' | 'sum'
+// —— 幫它量出結論的人自己送不出去，這種缺口不寫測試就會再發生一次。
+{
+  const seen = [];
+  const capture = (req) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => seen.push(JSON.parse(raw)));
+  };
+  const d = await fakeDaemon({
+    Search: (req) => {
+      capture(req);
+      return [200, {
+        chunker: 'para-v1', durationMs: 2, indexVersion: 3, normalizedQuery: 'bash',
+        docAggregation: 'mean', groupBy: 'doc', order: 'score desc', limit: 10, returned: 1,
+        hits: [{ bestChunkOrdinal: 8, bestChunkScore: 2.21, chunkCount: 12, docId: 'docs/linux-build.md', kind: 'doc', labels: {}, matchedChunkCount: 4, score: 0.5525, snippet: 'x' }],
+        matchedDocuments: 1, namespaceDocuments: 86,
+      }];
+    },
+  });
+  const out = await rel.searchIndex(envOf(d.port), 'demo', 'bash', { groupBy: 'doc', docAggregation: 'mean' });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await d.stop();
+
+  ok('wire: docAggregation:"mean" reaches the server (the client can express it)', seen[0]?.docAggregation === 'mean', JSON.stringify(seen[0]));
+  ok('...and its echo is passed through like the other two', out.ok === true && out.docAggregation === 'mean', JSON.stringify(out.docAggregation));
+  ok('...with the doc-level score being the aggregate, not bestChunkScore', out.ok === true && out.hits?.[0]?.score === 0.5525, JSON.stringify(out.hits?.[0]));
+}
+
 // 8p. docAggregation 不配 groupBy:"doc" → 本地就拒絕，連請求都不發
 {
   const out = await rel.searchIndex({ baseUrl: 'http://127.0.0.1:9', source: 'test', token: '' }, 'demo', 'x', { docAggregation: 'max' });

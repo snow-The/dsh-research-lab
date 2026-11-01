@@ -164,7 +164,8 @@ export interface IndexHit {
   // ---- doc 模式（`groupBy: "doc"`）才有的欄位 ----
   /** 最高分區塊在該文件中的序號。 */
   bestChunkOrdinal?: number
-  /** 最高單一區塊分數。`score` 在 `docAggregation:"max"` 時等於它、`"sum"` 時不是。 */
+  /** 最高單一區塊分數。`score` 只在 `docAggregation:"max"` 時等於它；
+   *  `"sum"` 與 `"mean"` 下都不是（sum 是所有命中塊之和、mean 是它們的均值）。 */
   bestChunkScore?: number
   /** 這份文件被切成幾塊（長度偏誤的來源，呼叫方要自己看）。 */
   chunkCount?: number
@@ -442,8 +443,12 @@ export async function searchIndex(
     syntax?: 'PLAIN' | 'TERMS'
     /** `doc` ＝ 回文件級排序（一個 docId 一條）。預設 `chunk`。 */
     groupBy?: 'chunk' | 'doc'
-    /** 只在 `groupBy:"doc"` 有意義：`max`（預設語意）或 `sum`。 */
-    docAggregation?: 'max' | 'sum'
+    /** 只在 `groupBy:"doc"` 有意義：`max` / `sum` / `mean`。
+     *
+     *  **不要在客戶端假設伺服器預設值。** 回應會回顯這次實際生效的 `docAggregation`，
+     *  以回顯為準（2026-11-01 的實驗裡這三種在 11 題上有 6/4/1 的勝場分布，
+     *  `mean` 對 `max` 顯著較好，但 `mean` 與 `sum` 分不開——它們量的是不同的問題）。 */
+    docAggregation?: 'max' | 'sum' | 'mean'
     timeoutMs?: number
   } = {},
 ): Promise<SearchOutcome | Failure> {
