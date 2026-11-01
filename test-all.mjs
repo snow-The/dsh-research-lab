@@ -1328,22 +1328,36 @@ async function searchIndex(env, namespace, query, opts = {}) {
   if (namespace.trim() === "") {
     return { code: "INVALID_REQUEST", message: "namespace must be non-empty", ok: false };
   }
+  if (opts.docAggregation !== void 0 && opts.groupBy !== "doc") {
+    return {
+      code: "INVALID_REQUEST",
+      message: 'docAggregation only means something with groupBy:"doc": pass both, or neither',
+      ok: false
+    };
+  }
   const payload = { namespace, query, snippet_chars: opts.snippetChars ?? 200 };
   if (opts.limit !== void 0) payload.limit = opts.limit;
   if (opts.syntax !== void 0) payload.syntax = opts.syntax === "TERMS" ? "SYNTAX_TERMS" : "SYNTAX_PLAIN";
+  if (opts.groupBy !== void 0) payload.groupBy = opts.groupBy;
+  if (opts.docAggregation !== void 0) payload.docAggregation = opts.docAggregation;
   const outcome = await call(env, "Search", payload, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   if (outcome.failure !== void 0) return outcome.failure;
   const body = asRecord(outcome.body);
   const hits = asArray(body.hits).map((raw) => {
     const hit = asRecord(raw);
     return {
-      chunkOrdinal: asNumber(hit.chunkOrdinal),
+      // doc 模式沒有這個欄位。缺席就真的不要放一個 0 進去——那個 0 會被讀成「第 0 塊」。
+      ...hit.chunkOrdinal === void 0 ? {} : { chunkOrdinal: asNumber(hit.chunkOrdinal) },
       docId: asString(hit.docId),
       kind: asString(hit.kind),
       labels: Object.fromEntries(Object.entries(asRecord(hit.labels)).map(([k, v]) => [k, String(v)])),
       score: asNumber(hit.score),
       snippet: asString(hit.snippet),
-      snippetTruncated: hit.snippetTruncated === true
+      snippetTruncated: hit.snippetTruncated === true,
+      ...hit.bestChunkOrdinal === void 0 ? {} : { bestChunkOrdinal: asNumber(hit.bestChunkOrdinal) },
+      ...hit.bestChunkScore === void 0 ? {} : { bestChunkScore: asNumber(hit.bestChunkScore) },
+      ...hit.chunkCount === void 0 ? {} : { chunkCount: asNumber(hit.chunkCount) },
+      ...hit.matchedChunkCount === void 0 ? {} : { matchedChunkCount: asNumber(hit.matchedChunkCount) }
     };
   });
   const matchedDocuments = asNumber(body.matchedDocuments);
@@ -1354,6 +1368,8 @@ async function searchIndex(env, namespace, query, opts = {}) {
     chunker: asString(body.chunker),
     durationMs: asNumber(body.durationMs),
     groupBy: asString(body.groupBy) || "chunk",
+    // 只有伺服器真的回了才放進來：缺席 ≠ 預設值。假設它是 max 就是把語意塞進客戶端。
+    ...asString(body.docAggregation) === "" ? {} : { docAggregation: asString(body.docAggregation) },
     hits,
     indexVersion: asNumber(body.indexVersion),
     // 伺服器回報的那幾個「我實際用了什麼」，照抄不重算：

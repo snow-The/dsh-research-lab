@@ -153,13 +153,23 @@ export interface IngestOutcome {
 }
 
 export interface IndexHit {
-  chunkOrdinal: number
+  /** chunk 模式才有；doc 模式（`groupBy`）回的是文件級條目，這個欄位不存在。 */
+  chunkOrdinal?: number
   docId: string
   kind: string
   labels: Record<string, string>
   score: number
   snippet: string
   snippetTruncated: boolean
+  // ---- doc 模式（`groupBy: "doc"`）才有的欄位 ----
+  /** 最高分區塊在該文件中的序號。 */
+  bestChunkOrdinal?: number
+  /** 最高單一區塊分數。`score` 在 `docAggregation:"max"` 時等於它、`"sum"` 時不是。 */
+  bestChunkScore?: number
+  /** 這份文件被切成幾塊（長度偏誤的來源，呼叫方要自己看）。 */
+  chunkCount?: number
+  /** 這次查詢命中幾塊。`score/sum` 用得到它，`score/max` 用不到。 */
+  matchedChunkCount?: number
 }
 
 /**
@@ -177,6 +187,11 @@ export interface SearchOutcome {
   durationMs: number
   /** 這次實際用的分組方式（`chunk` 或 `doc`）——由伺服器回報，不是客戶端假設。 */
   groupBy: string
+  /**
+   * doc 模式下伺服器實際用的聚合方式（`max` / `sum`）。伺服器回什麼就轉什麼，
+   * 客戶端**不解釋** `score`——同一個數字在兩種聚合下意思不同，解釋權在伺服器的 `semantics`。
+   */
+  docAggregation?: string
   hits: IndexHit[]
   indexVersion: number
   /** **伺服器實際採用的 limit**。要求 500 而得到 100 時，這裡是 100（契約夾鉗，不是靜默改寫）。 */
@@ -421,15 +436,35 @@ export async function searchIndex(
   env: CapIndexEnv,
   namespace: string,
   query: string,
-  opts: { limit?: number; snippetChars?: number; syntax?: 'PLAIN' | 'TERMS'; timeoutMs?: number } = {},
+  opts: {
+    limit?: number
+    snippetChars?: number
+    syntax?: 'PLAIN' | 'TERMS'
+    /** `doc` ＝ 回文件級排序（一個 docId 一條）。預設 `chunk`。 */
+    groupBy?: 'chunk' | 'doc'
+    /** 只在 `groupBy:"doc"` 有意義：`max`（預設語意）或 `sum`。 */
+    docAggregation?: 'max' | 'sum'
+    timeoutMs?: number
+  } = {},
 ): Promise<SearchOutcome | Failure> {
   if (namespace.trim() === '') {
     return { code: 'INVALID_REQUEST', message: 'namespace must be non-empty', ok: false }
+  }
+  // `docAggregation` 只在 doc 模式下有意義（伺服器對 chunk 模式帶它會回 400「沒有作用的欄位是謊」）。
+  // 呼叫方自己能擋得更早：連請求都不發，也就不用去解讀那個 400 到底是什麼意思。
+  if (opts.docAggregation !== undefined && opts.groupBy !== 'doc') {
+    return {
+      code: 'INVALID_REQUEST',
+      message: 'docAggregation only means something with groupBy:"doc": pass both, or neither',
+      ok: false,
+    }
   }
 
   const payload: Record<string, unknown> = { namespace, query, snippet_chars: opts.snippetChars ?? 200 }
   if (opts.limit !== undefined) payload.limit = opts.limit
   if (opts.syntax !== undefined) payload.syntax = opts.syntax === 'TERMS' ? 'SYNTAX_TERMS' : 'SYNTAX_PLAIN'
+  if (opts.groupBy !== undefined) payload.groupBy = opts.groupBy
+  if (opts.docAggregation !== undefined) payload.docAggregation = opts.docAggregation
 
   const outcome = await call(env, 'Search', payload, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
   if (outcome.failure !== undefined) return outcome.failure
@@ -438,13 +473,18 @@ export async function searchIndex(
   const hits = asArray(body.hits).map((raw): IndexHit => {
     const hit = asRecord(raw)
     return {
-      chunkOrdinal: asNumber(hit.chunkOrdinal),
+      // doc 模式沒有這個欄位。缺席就真的不要放一個 0 進去——那個 0 會被讀成「第 0 塊」。
+      ...(hit.chunkOrdinal === undefined ? {} : { chunkOrdinal: asNumber(hit.chunkOrdinal) }),
       docId: asString(hit.docId),
       kind: asString(hit.kind),
       labels: Object.fromEntries(Object.entries(asRecord(hit.labels)).map(([k, v]) => [k, String(v)])),
       score: asNumber(hit.score),
       snippet: asString(hit.snippet),
       snippetTruncated: hit.snippetTruncated === true,
+      ...(hit.bestChunkOrdinal === undefined ? {} : { bestChunkOrdinal: asNumber(hit.bestChunkOrdinal) }),
+      ...(hit.bestChunkScore === undefined ? {} : { bestChunkScore: asNumber(hit.bestChunkScore) }),
+      ...(hit.chunkCount === undefined ? {} : { chunkCount: asNumber(hit.chunkCount) }),
+      ...(hit.matchedChunkCount === undefined ? {} : { matchedChunkCount: asNumber(hit.matchedChunkCount) }),
     }
   })
 
@@ -458,6 +498,8 @@ export async function searchIndex(
     chunker: asString(body.chunker),
     durationMs: asNumber(body.durationMs),
     groupBy: asString(body.groupBy) || 'chunk',
+    // 只有伺服器真的回了才放進來：缺席 ≠ 預設值。假設它是 max 就是把語意塞進客戶端。
+    ...(asString(body.docAggregation) === '' ? {} : { docAggregation: asString(body.docAggregation) }),
     hits,
     indexVersion: asNumber(body.indexVersion),
     // 伺服器回報的那幾個「我實際用了什麼」，照抄不重算：

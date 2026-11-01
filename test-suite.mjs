@@ -253,6 +253,49 @@ const okInfo = { capabilities: ['index:fts5'], chunker: 'para-v1', contractVersi
   ok('wire: dryRun is forwarded', seen[2]?.dryRun === true, JSON.stringify(seen[2]));
 }
 
+// 8o. doc 模式：groupBy 與 docAggregation 要真的送上線；伺服器選的聚合要原樣傳出
+{
+  const seen = [];
+  const capture = (req) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => seen.push(JSON.parse(raw)));
+  };
+  const d = await fakeDaemon({
+    Search: (req) => {
+      capture(req);
+      return [200, {
+        chunker: 'para-v1', durationMs: 2, indexVersion: 3, normalizedQuery: 'bash',
+        docAggregation: 'max', groupBy: 'doc', order: 'score desc', limit: 10, returned: 1,
+        hits: [{ bestChunkOrdinal: 8, bestChunkScore: 2.21, chunkCount: 12, docId: 'docs/linux-build.md', kind: 'doc', labels: {}, matchedChunkCount: 4, score: 2.21, snippet: 'x' }],
+        matchedDocuments: 1, namespaceDocuments: 86,
+      }];
+    },
+  });
+  const out = await rel.searchIndex(envOf(d.port), 'demo', 'bash', { groupBy: 'doc', docAggregation: 'max' });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await d.stop();
+
+  ok('wire: groupBy:"doc" is a field on the request, not a client-side regroup', seen[0]?.groupBy === 'doc', JSON.stringify(seen[0]));
+  ok('wire: docAggregation is sent, never inferred by the client', seen[0]?.docAggregation === 'max', JSON.stringify(seen[0]));
+  ok('the aggregation the server actually used is echoed, not assumed', out.ok === true && out.docAggregation === 'max', JSON.stringify(out.docAggregation));
+  const h = out.hits?.[0] ?? {};
+  ok(
+    'doc hit keeps the fields the caller needs to judge length bias',
+    h.docId === 'docs/linux-build.md' && h.bestChunkScore === 2.21 && h.chunkCount === 12 && h.matchedChunkCount === 4,
+    JSON.stringify(h),
+  );
+  // 缺席就是缺席：塞一個 0 進去會被讀成「第 0 塊」，那是編造。
+  ok('doc hit has no fabricated chunkOrdinal', !('chunkOrdinal' in h), JSON.stringify(h));
+}
+
+// 8p. docAggregation 不配 groupBy:"doc" → 本地就拒絕，連請求都不發
+{
+  const out = await rel.searchIndex({ baseUrl: 'http://127.0.0.1:9', source: 'test', token: '' }, 'demo', 'x', { docAggregation: 'max' });
+  ok('docAggregation without groupBy=doc is rejected locally', out.ok === false && out.code === 'INVALID_REQUEST', JSON.stringify(out));
+  ok('...and the message says what to pass instead', /groupBy:"doc"/.test(out.message ?? ''), String(out.message));
+}
+
 // 8k. 矛盾與空目標都在本地就被擋：連請求都不發
 {
   const d = await fakeDaemon({ Delete: () => [200, { deletedChunks: 0, deletedDocuments: 0 }] });
