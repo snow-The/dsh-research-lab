@@ -22,7 +22,8 @@
     "test:absorb": "node --import ./test-hooks.mjs test-absorb.mjs",
     "test:ingest": "node --import ./test-hooks.mjs test-ingest.mjs",
     "prefuzz": "npm run build:tests",
-    "fuzz": "node test-fuzz-ingest.mjs"
+    "fuzz": "node test-fuzz-ingest.mjs",
+    "test:concurrent": "node test-concurrent-writers.mjs"
   },
   "files": [
     "dist",

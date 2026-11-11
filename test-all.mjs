@@ -558,8 +558,328 @@ function rewriteReport(text) {
 }
 
 // src/extract.ts
+import * as path3 from "node:path";
+
+// src/store.ts
+import { createHash, randomBytes } from "node:crypto";
 import * as fs2 from "node:fs";
 import * as path2 from "node:path";
+var RLAB_DIR = ".rlab";
+function rlabDir(project) {
+  const abs = path2.resolve(project);
+  return path2.join(abs, RLAB_DIR);
+}
+function ensureDir(p) {
+  fs2.mkdirSync(p, { recursive: true });
+}
+var MAX_APPEND_RECORD_BYTES = 4096;
+var AppendRecordTooLargeError = class extends Error {
+  code = "APPEND_RECORD_TOO_LARGE";
+  file;
+  bytes;
+  limit;
+  constructor(file, bytes, label = "record") {
+    super(label + " is " + bytes + " bytes (JSON + newline), above the " + MAX_APPEND_RECORD_BYTES + "-byte atomic-append boundary for " + file + ". Refusing to write: split it into several records first (never truncated silently).");
+    this.name = "AppendRecordTooLargeError";
+    this.file = file;
+    this.bytes = bytes;
+    this.limit = MAX_APPEND_RECORD_BYTES;
+  }
+};
+function nowIso() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function ownerOf(owner) {
+  const s = typeof owner === "string" ? owner.trim() : "";
+  return s ? s.slice(0, 120) : "unknown";
+}
+function lineFingerprint(rawLine) {
+  return createHash("sha256").update(rawLine, "utf8").digest("hex").slice(0, 16);
+}
+function entryFingerprint(at, owner, body) {
+  return lineFingerprint(at + "\0" + owner + "\0" + body);
+}
+function readJsonLines(file) {
+  let text = "";
+  try {
+    text = fs2.readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const raw of text.split("\n")) {
+    if (!raw.trim()) continue;
+    try {
+      const value = JSON.parse(raw);
+      if (value && typeof value === "object") out.push({ raw, value });
+    } catch {
+    }
+  }
+  return out;
+}
+function appendJsonLine(file, record, label = "record") {
+  const raw = JSON.stringify(record);
+  const bytes = Buffer.byteLength(raw, "utf8") + 1;
+  if (bytes > MAX_APPEND_RECORD_BYTES) throw new AppendRecordTooLargeError(file, bytes, label);
+  ensureDir(path2.dirname(file));
+  fs2.appendFileSync(file, raw + "\n", { encoding: "utf8" });
+  return raw;
+}
+var WIKI_DIR = "wiki";
+function parseFrontmatter(text) {
+  const out = {};
+  const m = text.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!m) return out;
+  for (const line of m[1].split("\n")) {
+    const mm = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!mm) continue;
+    const key = mm[1];
+    const val = mm[2].trim();
+    if (val.startsWith("[") && val.endsWith("]")) {
+      out[key] = val.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+function wikiPath(project, kind, id) {
+  const safe = id.replace(/[^A-Za-z0-9_.-]/g, "_");
+  return path2.join(rlabDir(project), WIKI_DIR, kind, safe + ".md");
+}
+function wikiHistoryPath(project, kind, id) {
+  return wikiPath(project, kind, id).replace(/\.md$/, "") + ".history.jsonl";
+}
+function splitBodyByBytes(body, maxBytes) {
+  const chunks = [];
+  let cur = "";
+  let curBytes = 0;
+  for (const ch of body) {
+    const b = Buffer.byteLength(ch, "utf8");
+    if (cur && curBytes + b > maxBytes) {
+      chunks.push(cur);
+      cur = "";
+      curBytes = 0;
+    }
+    cur += ch;
+    curBytes += b;
+  }
+  if (cur) chunks.push(cur);
+  return chunks.length ? chunks : [""];
+}
+function buildWikiHistoryLines(meta, body) {
+  const base = { at: meta.at, owner: meta.owner };
+  if (meta.supersedes) base.supersedes = meta.supersedes;
+  const single = { ...base, body };
+  if (Buffer.byteLength(JSON.stringify(single), "utf8") + 1 <= MAX_APPEND_RECORD_BYTES) return [single];
+  const entry = entryFingerprint(meta.at, meta.owner, body);
+  let budget = Math.floor(MAX_APPEND_RECORD_BYTES / 2);
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const parts = splitBodyByBytes(body, Math.max(1, budget));
+    const lines = parts.map((part, i) => ({ ...base, entry, chunk: i, chunks: parts.length, body: part }));
+    if (lines.every((l) => Buffer.byteLength(JSON.stringify(l), "utf8") + 1 <= MAX_APPEND_RECORD_BYTES)) return lines;
+    budget = Math.floor(budget / 2);
+  }
+  throw new Error("wiki history body could not be split under " + MAX_APPEND_RECORD_BYTES + " bytes");
+}
+function appendWikiHistory(project, kind, id, body, owner) {
+  const file = wikiHistoryPath(project, kind, id);
+  const previous = readWikiHistory(project, kind, id);
+  const at = nowIso();
+  const meta = { at, owner, supersedes: previous.length ? previous[previous.length - 1].fingerprint : void 0 };
+  for (const line of buildWikiHistoryLines(meta, body)) {
+    appendJsonLine(file, line, "wiki history entry for " + kind + ":" + id);
+  }
+}
+function readWikiHistory(project, kind, id) {
+  const file = wikiHistoryPath(project, kind, id);
+  const entries = [];
+  const groups = /* @__PURE__ */ new Map();
+  let order = 0;
+  for (const { value: rec } of readJsonLines(file)) {
+    if (typeof rec.body !== "string" || typeof rec.at !== "string") continue;
+    const owner = ownerOf(rec.owner);
+    const supersedes = typeof rec.supersedes === "string" && rec.supersedes ? rec.supersedes : void 0;
+    if (typeof rec.chunk === "number" && typeof rec.chunks === "number" && typeof rec.entry === "string") {
+      const g = groups.get(rec.entry) ?? { order: order++, at: rec.at, owner, supersedes, total: rec.chunks, parts: /* @__PURE__ */ new Map() };
+      g.parts.set(rec.chunk, rec.body);
+      groups.set(rec.entry, g);
+      continue;
+    }
+    entries.push({ order: order++, at: rec.at, owner, supersedes, body: rec.body, chunks: 1 });
+  }
+  for (const g of groups.values()) {
+    if (g.parts.size !== g.total) continue;
+    let body = "";
+    for (let i = 0; i < g.total; i++) body += g.parts.get(i) ?? "";
+    entries.push({ order: g.order, at: g.at, owner: g.owner, supersedes: g.supersedes, body, chunks: g.total });
+  }
+  entries.sort((a, b) => a.order - b.order);
+  const withFp = entries.map((e) => ({ ...e, fingerprint: entryFingerprint(e.at, e.owner, e.body) }));
+  const indicesByFingerprint = /* @__PURE__ */ new Map();
+  withFp.forEach((e, i) => {
+    const arr = indicesByFingerprint.get(e.fingerprint);
+    if (arr) arr.push(i);
+    else indicesByFingerprint.set(e.fingerprint, [i]);
+  });
+  const hidden = withFp.map(() => false);
+  withFp.forEach((e, i) => {
+    if (!e.supersedes) return;
+    for (const j of indicesByFingerprint.get(e.supersedes) ?? []) if (j < i) hidden[j] = true;
+  });
+  return withFp.map((e, i) => ({ at: e.at, owner: e.owner, supersedes: e.supersedes, body: e.body, fingerprint: e.fingerprint, chunks: e.chunks, superseded: hidden[i] }));
+}
+function renameWithRetry(from, to, attempts = 12) {
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      fs2.renameSync(from, to);
+      return;
+    } catch (e) {
+      last = e;
+      const code = String(e?.code ?? "");
+      if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3 + i * 3);
+    }
+  }
+  try {
+    fs2.unlinkSync(from);
+  } catch {
+  }
+  throw last;
+}
+function writeWikiPage(project, page) {
+  const p = wikiPath(project, page.kind, page.id);
+  const fm = [
+    "---",
+    "id: " + page.id,
+    "kind: " + page.kind,
+    "title: " + page.title.replace(/\n/g, " "),
+    "updated: " + page.updated,
+    page.tags?.length ? "tags: [" + page.tags.join(", ") + "]" : "tags: []",
+    "---",
+    ""
+  ].join("\n");
+  const body = [
+    fm,
+    "# " + page.title,
+    "",
+    page.content.trim(),
+    ""
+  ].join("\n");
+  ensureDir(path2.dirname(p));
+  appendWikiHistory(project, page.kind, page.id, body, ownerOf(page.owner));
+  const tmp = p + "." + process.pid + "." + randomBytes(6).toString("hex") + ".tmp";
+  fs2.writeFileSync(tmp, body, "utf8");
+  renameWithRetry(tmp, p);
+  const log = path2.join(rlabDir(project), "wiki", "log.md");
+  const stamp = nowIso();
+  fs2.appendFileSync(log, "- " + stamp + "  " + page.kind + ":" + page.id + "  " + page.title.replace(/[\r\n]+/g, " ") + "\n", "utf8");
+  return p;
+}
+function listWiki(project) {
+  const root = path2.join(rlabDir(project), WIKI_DIR);
+  const pages = [];
+  const kinds = ["experiment", "literature", "decision", "todo"];
+  for (const kind of kinds) {
+    const dir = path2.join(root, kind);
+    if (!fs2.existsSync(dir)) continue;
+    for (const f of fs2.readdirSync(dir)) {
+      if (!f.endsWith(".md")) continue;
+      const full = path2.join(dir, f);
+      const text = fs2.readFileSync(full, "utf8");
+      const fm = parseFrontmatter(text);
+      const title = String(fm.title || (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, ""));
+      const updated = String(fm.updated || "");
+      const tags = Array.isArray(fm.tags) ? fm.tags : fm.tags ? [String(fm.tags)] : [];
+      pages.push({ kind, id: f.replace(/\.md$/, ""), title, updated, tags, content: "" });
+    }
+  }
+  return pages.sort((a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id));
+}
+function rebuildWikiIndex(project) {
+  const pages = listWiki(project);
+  const lines = ["# Research Wiki Index", "", "Auto-generated by dsh-research-lab. Do not edit by hand.", ""];
+  const kinds = [
+    { k: "experiment", label: "## Experiments" },
+    { k: "literature", label: "## Literature" },
+    { k: "decision", label: "## Decisions" },
+    { k: "todo", label: "## TODO" }
+  ];
+  for (const { k, label } of kinds) {
+    const sub = pages.filter((p) => p.kind === k);
+    if (!sub.length) continue;
+    lines.push(label);
+    for (const p of sub) {
+      lines.push("- [" + p.title + "](wiki/" + k + "/" + p.id + ".md)" + (p.updated ? "  _" + p.updated + "_" : ""));
+    }
+    lines.push("");
+  }
+  const idx = path2.join(rlabDir(project), WIKI_DIR, "index.md");
+  ensureDir(path2.dirname(idx));
+  fs2.writeFileSync(idx, lines.join("\n") + "\n", "utf8");
+  return idx;
+}
+function benchFile(project) {
+  return path2.join(rlabDir(project), "bench.jsonl");
+}
+function appendBench(project, row) {
+  const file = benchFile(project);
+  ensureDir(path2.dirname(file));
+  fs2.appendFileSync(file, JSON.stringify(row) + "\n", "utf8");
+  return readBench(project);
+}
+function readBench(project) {
+  const file = benchFile(project);
+  if (!fs2.existsSync(file)) return [];
+  const rows = [];
+  for (const line of fs2.readFileSync(file, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      rows.push(JSON.parse(line));
+    } catch {
+    }
+  }
+  return rows;
+}
+function benchReport(project, model, task) {
+  let rows = readBench(project);
+  if (!rows.length) return "No benchmark rows yet for " + project + ". Add one with rlab_bench.";
+  if (model) rows = rows.filter((r) => r.model.toLowerCase().includes(model.toLowerCase()));
+  if (task) rows = rows.filter((r) => r.task.toLowerCase().includes(task.toLowerCase()));
+  if (!rows.length) return "No rows match the filter.";
+  const lines = ["# Bench ledger \u2014 " + project, ""];
+  const byTask = /* @__PURE__ */ new Map();
+  for (const r of rows) {
+    const arr = byTask.get(r.task) || [];
+    arr.push(r);
+    byTask.set(r.task, arr);
+  }
+  for (const [t, rs] of [...byTask.entries()].sort()) {
+    lines.push("## " + t + "  (" + rs.length + " runs)");
+    const byModel = /* @__PURE__ */ new Map();
+    for (const r of rs) {
+      const arr = byModel.get(r.model) || [];
+      arr.push(r);
+      byModel.set(r.model, arr);
+    }
+    for (const [m, mr] of [...byModel.entries()].sort()) {
+      const latest = mr[mr.length - 1];
+      const all = mr.map((r) => r.score.toFixed(4)).join(" \u2192 ");
+      lines.push("- **" + m + "**  latest=" + latest.score.toFixed(4) + " (" + latest.metric + ")  history=[" + all + "]");
+      if (latest.split) lines.push("  - split=" + latest.split + (latest.hf_subset ? " subset=" + latest.hf_subset : "") + "  " + latest.date + (latest.note ? "  \u2014 " + latest.note : ""));
+    }
+    const splits = new Set(rs.map((r) => r.split || "?"));
+    if (splits.size > 1) {
+      lines.push("  \u26A0\uFE0F **\u53E3\u5F84\u4E0D\u4E00\u81F4**: runs use different splits (" + [...splits].join(", ") + ") \u2014 do NOT compare across splits.");
+    }
+    lines.push("");
+  }
+  lines.push("_Ledger: " + benchFile(project) + "_");
+  return lines.join("\n");
+}
+
+// src/extract.ts
 function betaConfidence(prior, cited, weight = 100) {
   return (prior * weight + cited) / (weight + cited);
 }
@@ -611,49 +931,104 @@ function extractClaims(text) {
   }
   return claims;
 }
-var claimsFile = (project) => path2.join(project, ".rlab", "claims.jsonl");
-function loadClaims(project) {
-  try {
-    const lines = fs2.readFileSync(claimsFile(project), "utf8").split("\n").filter(Boolean);
-    return lines.map((l) => JSON.parse(l));
-  } catch {
-    return [];
+var claimsFile = (project) => path3.join(project, ".rlab", "claims.jsonl");
+function readClaimLines(project) {
+  const out = [];
+  for (const { raw, value } of readJsonLines(claimsFile(project))) {
+    if (!value || typeof value !== "object") continue;
+    out.push({ raw, record: value });
   }
+  return out;
 }
-function addClaims(project, docId, text) {
-  const existing = loadClaims(project);
-  let nextId = existing.length ? Math.max(...existing.map((c) => c.id)) + 1 : 1;
-  const fresh = extractClaims(text);
+function supersedeMask(lines) {
+  const live = lines.map(() => true);
+  const indicesByFingerprint = /* @__PURE__ */ new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const fp = lineFingerprint(lines[i].raw);
+    const arr = indicesByFingerprint.get(fp);
+    if (arr) arr.push(i);
+    else indicesByFingerprint.set(fp, [i]);
+    const s = lines[i].record.supersedes;
+    if (!s) continue;
+    for (const j of indicesByFingerprint.get(s) ?? []) if (j < i) live[j] = false;
+  }
+  return live;
+}
+function loadClaims(project, opts = {}) {
+  const lines = readClaimLines(project);
+  const live = supersedeMask(lines);
+  return lines.map((line, i) => ({ line, i })).filter(({ i }) => opts.includeSuperseded === true || live[i]).sort((a, b) => (Number(a.line.record.id) || 0) - (Number(b.line.record.id) || 0) || a.i - b.i).map(({ line }) => line.record);
+}
+function nextClaimId(project) {
+  let max = 0;
+  for (const l of readClaimLines(project)) max = Math.max(max, Number(l.record.id) || 0);
+  return max + 1;
+}
+function appendClaim(project, claim, owner) {
+  const recordedAt = typeof claim.recordedAt === "string" && claim.recordedAt ? claim.recordedAt : nowIso();
+  const cited = Number(claim.cited ?? 0) || 0;
+  const id = Number.isFinite(Number(claim.id)) && Number(claim.id) > 0 ? Number(claim.id) : nextClaimId(project);
+  const record = {
+    id,
+    docId: Number(claim.docId ?? 0) || 0,
+    type: claim.type ?? "contribution",
+    subject: String(claim.subject ?? ""),
+    ...claim.value !== void 0 ? { value: String(claim.value) } : {},
+    ...claim.task !== void 0 ? { task: String(claim.task) } : {},
+    context: String(claim.context ?? ""),
+    cited,
+    confidence: typeof claim.confidence === "number" ? claim.confidence : betaConfidence(0.5, cited),
+    date: typeof claim.date === "string" && claim.date ? claim.date : recordedAt.slice(0, 10),
+    owner: ownerOf(owner ?? claim.owner),
+    recordedAt,
+    ...claim.supersedes ? { supersedes: String(claim.supersedes) } : {}
+  };
+  appendJsonLine(claimsFile(project), record, "claim #" + id);
+  return record;
+}
+function addClaims(project, docId, text, owner) {
+  let nextId = nextClaimId(project);
   const prior = 0.5;
   const added = [];
-  fs2.mkdirSync(path2.dirname(claimsFile(project)), { recursive: true });
-  for (const c of fresh) {
-    const claim = { id: nextId++, docId, ...c, cited: 0, confidence: betaConfidence(prior, 0), date: (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) };
-    fs2.appendFileSync(claimsFile(project), JSON.stringify(claim) + "\n", "utf8");
-    added.push(claim);
+  for (const c of extractClaims(text)) {
+    added.push(appendClaim(project, { id: nextId++, docId, ...c, cited: 0, confidence: betaConfidence(prior, 0) }, owner));
   }
   return added;
 }
-function citeClaim(project, claimId, weight = 100) {
-  const claims = loadClaims(project);
-  const c = claims.find((x) => x.id === claimId);
-  if (!c) return null;
-  c.cited += 1;
-  c.confidence = betaConfidence(0.5, c.cited, weight);
-  fs2.writeFileSync(claimsFile(project), claims.map((x) => JSON.stringify(x)).join("\n") + "\n", "utf8");
-  return c;
+function citeClaim(project, claimId, weight = 100, owner) {
+  const lines = readClaimLines(project);
+  const live = supersedeMask(lines);
+  let pick = -1;
+  for (let i = 0; i < lines.length; i++) if (live[i] && Number(lines[i].record.id) === claimId) pick = i;
+  if (pick < 0) return null;
+  const old = lines[pick].record;
+  const cited = (Number(old.cited) || 0) + 1;
+  const record = {
+    ...old,
+    cited,
+    confidence: betaConfidence(0.5, cited, weight),
+    owner: ownerOf(owner),
+    recordedAt: nowIso(),
+    supersedes: lineFingerprint(lines[pick].raw)
+  };
+  appendJsonLine(claimsFile(project), record, "cite claim #" + claimId);
+  return record;
 }
-function claimsReport(project, type) {
-  const claims = loadClaims(project);
+function claimsReport(project, type, opts = {}) {
+  const claims = loadClaims(project, opts);
   if (!claims.length) return "No claims recorded yet. Use rlab_claim action=extract.";
   const rows = type ? claims.filter((c) => c.type === type) : claims;
   const lines = ["# Claim ledger \u2014 " + project + " (" + rows.length + " claims)", ""];
   for (const c of rows) {
-    lines.push("[" + c.id + "] " + c.type.toUpperCase() + "  conf=" + c.confidence.toFixed(3) + " cited=" + c.cited);
+    lines.push("[" + c.id + "] " + String(c.type ?? "").toUpperCase() + "  conf=" + Number(c.confidence || 0).toFixed(3) + " cited=" + (Number(c.cited) || 0));
     if (c.subject) lines.push("  subject: " + c.subject);
     if (c.value) lines.push("  value: " + c.value + (c.task ? "  on: " + c.task : ""));
-    lines.push('  ctx: "' + c.context.slice(0, 140) + '"');
+    lines.push('  ctx: "' + String(c.context ?? "").slice(0, 140) + '"');
     lines.push("");
+  }
+  if (opts.includeSuperseded !== true) {
+    const hidden = loadClaims(project, { includeSuperseded: true }).length - claims.length;
+    if (hidden > 0) lines.push("_(" + hidden + " superseded version(s) hidden \u2014 rlab_claim action=list includeSuperseded=true shows them)_", "");
   }
   return lines.join("\n");
 }
@@ -689,10 +1064,10 @@ async function suggestZh(query, max = 5) {
 // src/arxiv.ts
 import { mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname as dirname3, join as join3 } from "node:path";
+import { dirname as dirname3, join as join4 } from "node:path";
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 var esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-var THROTTLE_FILE = join3(process.env.DSH_HOME ?? join3(homedir(), ".dsh"), ".arxiv-throttle");
+var THROTTLE_FILE = join4(process.env.DSH_HOME ?? join4(homedir(), ".dsh"), ".arxiv-throttle");
 var MIN_GAP_MS = 3100;
 async function gate() {
   for (; ; ) {
@@ -798,182 +1173,21 @@ function formatPapers(papers, withSummary = false) {
   return lines.join("\n").trim();
 }
 
-// src/store.ts
-import * as fs3 from "node:fs";
-import * as path3 from "node:path";
-var RLAB_DIR = ".rlab";
-function rlabDir(project) {
-  const abs = path3.resolve(project);
-  return path3.join(abs, RLAB_DIR);
-}
-function ensureDir(p) {
-  fs3.mkdirSync(p, { recursive: true });
-}
-var WIKI_DIR = "wiki";
-function parseFrontmatter(text) {
-  const out = {};
-  const m = text.match(/^---\s*\n([\s\S]*?)\n---/);
-  if (!m) return out;
-  for (const line of m[1].split("\n")) {
-    const mm = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
-    if (!mm) continue;
-    const key = mm[1];
-    const val = mm[2].trim();
-    if (val.startsWith("[") && val.endsWith("]")) {
-      out[key] = val.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
-    } else {
-      out[key] = val;
-    }
-  }
-  return out;
-}
-function wikiPath(project, kind, id) {
-  const safe = id.replace(/[^A-Za-z0-9_.-]/g, "_");
-  return path3.join(rlabDir(project), WIKI_DIR, kind, safe + ".md");
-}
-function writeWikiPage(project, page) {
-  const p = wikiPath(project, page.kind, page.id);
-  const fm = [
-    "---",
-    "id: " + page.id,
-    "kind: " + page.kind,
-    "title: " + page.title.replace(/\n/g, " "),
-    "updated: " + page.updated,
-    page.tags?.length ? "tags: [" + page.tags.join(", ") + "]" : "tags: []",
-    "---",
-    ""
-  ].join("\n");
-  const body = [
-    fm,
-    "# " + page.title,
-    "",
-    page.content.trim(),
-    ""
-  ].join("\n");
-  ensureDir(path3.dirname(p));
-  fs3.writeFileSync(p, body, "utf8");
-  const log = path3.join(rlabDir(project), "wiki", "log.md");
-  const stamp = (/* @__PURE__ */ new Date()).toISOString();
-  fs3.appendFileSync(log, "- " + stamp + "  " + page.kind + ":" + page.id + "  " + page.title.replace(/[\r\n]+/g, " ") + "\n", "utf8");
-  return p;
-}
-function listWiki(project) {
-  const root = path3.join(rlabDir(project), WIKI_DIR);
-  const pages = [];
-  const kinds = ["experiment", "literature", "decision", "todo"];
-  for (const kind of kinds) {
-    const dir = path3.join(root, kind);
-    if (!fs3.existsSync(dir)) continue;
-    for (const f of fs3.readdirSync(dir)) {
-      if (!f.endsWith(".md")) continue;
-      const full = path3.join(dir, f);
-      const text = fs3.readFileSync(full, "utf8");
-      const fm = parseFrontmatter(text);
-      const title = String(fm.title || (text.match(/^# (.+)$/m) || [])[1] || f.replace(/\.md$/, ""));
-      const updated = String(fm.updated || "");
-      const tags = Array.isArray(fm.tags) ? fm.tags : fm.tags ? [String(fm.tags)] : [];
-      pages.push({ kind, id: f.replace(/\.md$/, ""), title, updated, tags, content: "" });
-    }
-  }
-  return pages.sort((a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id));
-}
-function rebuildWikiIndex(project) {
-  const pages = listWiki(project);
-  const lines = ["# Research Wiki Index", "", "Auto-generated by dsh-research-lab. Do not edit by hand.", ""];
-  const kinds = [
-    { k: "experiment", label: "## Experiments" },
-    { k: "literature", label: "## Literature" },
-    { k: "decision", label: "## Decisions" },
-    { k: "todo", label: "## TODO" }
-  ];
-  for (const { k, label } of kinds) {
-    const sub = pages.filter((p) => p.kind === k);
-    if (!sub.length) continue;
-    lines.push(label);
-    for (const p of sub) {
-      lines.push("- [" + p.title + "](wiki/" + k + "/" + p.id + ".md)" + (p.updated ? "  _" + p.updated + "_" : ""));
-    }
-    lines.push("");
-  }
-  const idx = path3.join(rlabDir(project), WIKI_DIR, "index.md");
-  ensureDir(path3.dirname(idx));
-  fs3.writeFileSync(idx, lines.join("\n") + "\n", "utf8");
-  return idx;
-}
-function benchFile(project) {
-  return path3.join(rlabDir(project), "bench.jsonl");
-}
-function appendBench(project, row) {
-  const file = benchFile(project);
-  ensureDir(path3.dirname(file));
-  fs3.appendFileSync(file, JSON.stringify(row) + "\n", "utf8");
-  return readBench(project);
-}
-function readBench(project) {
-  const file = benchFile(project);
-  if (!fs3.existsSync(file)) return [];
-  const rows = [];
-  for (const line of fs3.readFileSync(file, "utf8").split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      rows.push(JSON.parse(line));
-    } catch {
-    }
-  }
-  return rows;
-}
-function benchReport(project, model, task) {
-  let rows = readBench(project);
-  if (!rows.length) return "No benchmark rows yet for " + project + ". Add one with rlab_bench.";
-  if (model) rows = rows.filter((r) => r.model.toLowerCase().includes(model.toLowerCase()));
-  if (task) rows = rows.filter((r) => r.task.toLowerCase().includes(task.toLowerCase()));
-  if (!rows.length) return "No rows match the filter.";
-  const lines = ["# Bench ledger \u2014 " + project, ""];
-  const byTask = /* @__PURE__ */ new Map();
-  for (const r of rows) {
-    const arr = byTask.get(r.task) || [];
-    arr.push(r);
-    byTask.set(r.task, arr);
-  }
-  for (const [t, rs] of [...byTask.entries()].sort()) {
-    lines.push("## " + t + "  (" + rs.length + " runs)");
-    const byModel = /* @__PURE__ */ new Map();
-    for (const r of rs) {
-      const arr = byModel.get(r.model) || [];
-      arr.push(r);
-      byModel.set(r.model, arr);
-    }
-    for (const [m, mr] of [...byModel.entries()].sort()) {
-      const latest = mr[mr.length - 1];
-      const all = mr.map((r) => r.score.toFixed(4)).join(" \u2192 ");
-      lines.push("- **" + m + "**  latest=" + latest.score.toFixed(4) + " (" + latest.metric + ")  history=[" + all + "]");
-      if (latest.split) lines.push("  - split=" + latest.split + (latest.hf_subset ? " subset=" + latest.hf_subset : "") + "  " + latest.date + (latest.note ? "  \u2014 " + latest.note : ""));
-    }
-    const splits = new Set(rs.map((r) => r.split || "?"));
-    if (splits.size > 1) {
-      lines.push("  \u26A0\uFE0F **\u53E3\u5F84\u4E0D\u4E00\u81F4**: runs use different splits (" + [...splits].join(", ") + ") \u2014 do NOT compare across splits.");
-    }
-    lines.push("");
-  }
-  lines.push("_Ledger: " + benchFile(project) + "_");
-  return lines.join("\n");
-}
-
 // src/ref.ts
 import { execSync } from "node:child_process";
-import * as fs4 from "node:fs";
+import * as fs3 from "node:fs";
 import * as path4 from "node:path";
 function cloneAndStudy(url, outDir, maxTree = 30) {
   const m = url.match(/github\.com\/([^\/]+)\/([^\/\s]+?)(?:\.git)?(?:\/|$)/);
   if (!m) throw new Error("not a github.com URL: " + url);
   const repo = m[1] + "/" + m[2].replace(/\.git$/, "");
-  fs4.mkdirSync(outDir, { recursive: true });
+  fs3.mkdirSync(outDir, { recursive: true });
   const dir = path4.join(outDir, m[2].replace(/\.git$/, ""));
   execSync("git clone --depth 1 https://github.com/" + repo + '.git "' + dir + '"', { stdio: "pipe", timeout: 12e4 });
   const head = (name, n = 40) => {
     const f = path4.join(dir, name);
     try {
-      return fs4.readFileSync(f, "utf8").slice(0, 1800);
+      return fs3.readFileSync(f, "utf8").slice(0, 1800);
     } catch {
       return "";
     }
@@ -983,7 +1197,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
   const tree = [];
   const walk = (d, depth) => {
     if (depth > 2 || tree.length >= maxTree) return;
-    for (const f of fs4.readdirSync(d, { withFileTypes: true })) {
+    for (const f of fs3.readdirSync(d, { withFileTypes: true })) {
       if (f.name.startsWith(".") || f.name === "node_modules") continue;
       const rel = path4.relative(dir, path4.join(d, f.name));
       tree.push((depth ? "  ".repeat(depth) : "") + rel + (f.isDirectory() ? "/" : ""));
@@ -993,7 +1207,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
   walk(dir, 0);
   let files = 0;
   const count = (d) => {
-    for (const f of fs4.readdirSync(d, { withFileTypes: true })) {
+    for (const f of fs3.readdirSync(d, { withFileTypes: true })) {
       if (f.name.startsWith(".")) continue;
       if (f.isDirectory()) count(path4.join(d, f.name));
       else files++;
@@ -1032,7 +1246,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
     ""
   ];
   const noteFile = path4.join(dir, "REF.md");
-  fs4.writeFileSync(noteFile, note.join("\n"), "utf8");
+  fs3.writeFileSync(noteFile, note.join("\n"), "utf8");
   return { repo, dir, readme, claudeMd, tree, files, noteFile };
 }
 
@@ -1135,7 +1349,7 @@ function renderScoop(a) {
 }
 
 // src/cap-index.ts
-import { readFileSync as readFileSync6 } from "node:fs";
+import { readFileSync as readFileSync5 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join6 } from "node:path";
 var MIN_CONTRACT_VERSION = 1;
@@ -1147,7 +1361,7 @@ function resolveEnv(opts = {}) {
   const busDir = join6(dshHome, "session-bus");
   const read = (file) => {
     try {
-      return readFileSync6(join6(busDir, file), "utf8").trim();
+      return readFileSync5(join6(busDir, file), "utf8").trim();
     } catch {
       return "";
     }
@@ -1460,12 +1674,16 @@ function describeAvailability(probe) {
   }
 }
 export {
+  AppendRecordTooLargeError,
   EXPECTED_CONTRACT_VERSION,
+  MAX_APPEND_RECORD_BYTES,
   MIN_CONTRACT_VERSION,
   absorbLedger,
   addClaims,
   addDoc,
   appendBench,
+  appendClaim,
+  appendJsonLine,
   arxivByIds,
   arxivQuery,
   arxivSearch,
@@ -1477,6 +1695,7 @@ export {
   cloneAndStudy,
   deleteDocuments,
   describeAvailability,
+  entryFingerprint,
   expandSearch,
   extractClaims,
   formatPapers,
@@ -1486,13 +1705,18 @@ export {
   ingestDocDir,
   ingestDocuments,
   isFailure,
+  lineFingerprint,
   listWiki,
   loadClaims,
   mineKeywords,
+  nowIso,
   openDb,
+  ownerOf,
   parseFrontmatter,
   probeIndex,
   readBench,
+  readJsonLines,
+  readWikiHistory,
   rebuildWikiIndex,
   recordAbsorbed,
   renderScoop,
@@ -1508,6 +1732,7 @@ export {
   tokenize,
   topKeywords,
   updateDoc,
+  wikiHistoryPath,
   wikiPath,
   writeWikiPage
 };

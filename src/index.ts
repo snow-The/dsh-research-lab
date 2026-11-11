@@ -93,6 +93,7 @@ export async function apply(ctx: any) {
       title: { type: 'string', required: true, description: 'page title' },
       content: { type: 'string', required: true, description: 'markdown body' },
       tags: { type: 'array', description: 'optional tags' },
+      owner: { type: 'string', description: 'session/agent id of the writer, recorded in <page>.history.jsonl (default: unknown)' },
     },
     output: textOut,
     timeoutMs: 15000,
@@ -105,6 +106,7 @@ export async function apply(ctx: any) {
       const p = writeWikiPage(project, {
         kind, id, title: String(args?.title ?? id), updated: today(),
         content: String(args?.content ?? ''), tags: args?.tags as string[] | undefined,
+        owner: args?.owner === undefined ? undefined : String(args.owner),
       });
       const idx = rebuildWikiIndex(project);
       let ix = '';
@@ -443,6 +445,8 @@ export async function apply(ctx: any) {
       docId: { type: 'number', description: 'indexed doc id to extract from (action=extract)' },
       claimId: { type: 'number', description: 'claim id to cite (action=cite)' },
       type: { type: 'string', description: 'filter list by claim type' },
+      owner: { type: 'string', description: 'session/agent id of the writer, stored on every record (default: unknown)' },
+      includeSuperseded: { type: 'boolean', description: 'list: also return versions a later record superseded (default false)' },
     },
     output: textOut,
     timeoutMs: 20000,
@@ -450,6 +454,7 @@ export async function apply(ctx: any) {
       const project = String(args?.project ?? '').trim();
       const action = String(args?.action ?? '').trim();
       if (!project || !action) throw new Error('project and action required');
+      const owner = args?.owner === undefined ? undefined : String(args.owner);
       switch (action) {
         case 'extract': {
           let docId = 0;
@@ -462,20 +467,20 @@ export async function apply(ctx: any) {
             textArg = row.title + ' ' + row.body;
           }
           if (!textArg.trim()) throw new Error('text or docId required');
-          const added = addClaims(project, docId, textArg);
+          const added = addClaims(project, docId, textArg, owner);
           if (!added.length) return 'No claims matched the templates in this text. Templates: "we propose/present X", "achieves Y on Z", "outperforms W by V" (en+zh).';
-          return 'Extracted ' + added.length + ' claims (confidences beta(0.5, cited=0)):\n\n' +
+          return 'Extracted ' + added.length + ' claims (appended to claims.jsonl, confidences beta(0.5, cited=0)):\n\n' +
             added.map(c => '[' + c.id + '] ' + c.type.toUpperCase() + ' conf=' + c.confidence.toFixed(3) + '\n  subject: ' + (c.subject || '—') + (c.value ? '  value: ' + c.value : '') + (c.task ? '  on: ' + c.task : '')).join('\n');
         }
         case 'cite': {
           const claimId = Number(args?.claimId);
           if (!claimId) throw new Error('claimId required');
-          const c = citeClaim(project, claimId);
+          const c = citeClaim(project, claimId, 100, owner);
           if (!c) throw new Error('claim #' + claimId + ' not found');
           return 'Cited claim #' + claimId + ' — confidence ' + c.confidence.toFixed(4) + ' (cited=' + c.cited + '). beta posterior rises with each citation.';
         }
         case 'list':
-          return claimsReport(project, args?.type ? String(args.type) : undefined);
+          return claimsReport(project, args?.type ? String(args.type) : undefined, { includeSuperseded: args?.includeSuperseded === true });
         default:
           throw new Error('action must be extract|cite|list');
       }

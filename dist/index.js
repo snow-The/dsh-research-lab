@@ -1,6 +1,6 @@
 // src/index.ts
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import * as fs7 from "node:fs";
+import * as fs6 from "node:fs";
 import * as path7 from "node:path";
 
 // src/arxiv.ts
@@ -116,6 +116,7 @@ function formatPapers(papers, withSummary = false) {
 }
 
 // src/store.ts
+import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 var RLAB_DIR = ".rlab";
@@ -125,6 +126,59 @@ function rlabDir(project) {
 }
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
+}
+var MAX_APPEND_RECORD_BYTES = 4096;
+var AppendRecordTooLargeError = class extends Error {
+  code = "APPEND_RECORD_TOO_LARGE";
+  file;
+  bytes;
+  limit;
+  constructor(file, bytes, label = "record") {
+    super(label + " is " + bytes + " bytes (JSON + newline), above the " + MAX_APPEND_RECORD_BYTES + "-byte atomic-append boundary for " + file + ". Refusing to write: split it into several records first (never truncated silently).");
+    this.name = "AppendRecordTooLargeError";
+    this.file = file;
+    this.bytes = bytes;
+    this.limit = MAX_APPEND_RECORD_BYTES;
+  }
+};
+function nowIso() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function ownerOf(owner) {
+  const s = typeof owner === "string" ? owner.trim() : "";
+  return s ? s.slice(0, 120) : "unknown";
+}
+function lineFingerprint(rawLine) {
+  return createHash("sha256").update(rawLine, "utf8").digest("hex").slice(0, 16);
+}
+function entryFingerprint(at, owner, body) {
+  return lineFingerprint(at + "\0" + owner + "\0" + body);
+}
+function readJsonLines(file) {
+  let text = "";
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const raw of text.split("\n")) {
+    if (!raw.trim()) continue;
+    try {
+      const value = JSON.parse(raw);
+      if (value && typeof value === "object") out.push({ raw, value });
+    } catch {
+    }
+  }
+  return out;
+}
+function appendJsonLine(file, record, label = "record") {
+  const raw = JSON.stringify(record);
+  const bytes = Buffer.byteLength(raw, "utf8") + 1;
+  if (bytes > MAX_APPEND_RECORD_BYTES) throw new AppendRecordTooLargeError(file, bytes, label);
+  ensureDir(path.dirname(file));
+  fs.appendFileSync(file, raw + "\n", { encoding: "utf8" });
+  return raw;
 }
 var WIKI_DIR = "wiki";
 function parseFrontmatter(text) {
@@ -148,6 +202,107 @@ function wikiPath(project, kind, id) {
   const safe = id.replace(/[^A-Za-z0-9_.-]/g, "_");
   return path.join(rlabDir(project), WIKI_DIR, kind, safe + ".md");
 }
+function wikiHistoryPath(project, kind, id) {
+  return wikiPath(project, kind, id).replace(/\.md$/, "") + ".history.jsonl";
+}
+function splitBodyByBytes(body, maxBytes) {
+  const chunks = [];
+  let cur = "";
+  let curBytes = 0;
+  for (const ch of body) {
+    const b = Buffer.byteLength(ch, "utf8");
+    if (cur && curBytes + b > maxBytes) {
+      chunks.push(cur);
+      cur = "";
+      curBytes = 0;
+    }
+    cur += ch;
+    curBytes += b;
+  }
+  if (cur) chunks.push(cur);
+  return chunks.length ? chunks : [""];
+}
+function buildWikiHistoryLines(meta, body) {
+  const base = { at: meta.at, owner: meta.owner };
+  if (meta.supersedes) base.supersedes = meta.supersedes;
+  const single = { ...base, body };
+  if (Buffer.byteLength(JSON.stringify(single), "utf8") + 1 <= MAX_APPEND_RECORD_BYTES) return [single];
+  const entry = entryFingerprint(meta.at, meta.owner, body);
+  let budget = Math.floor(MAX_APPEND_RECORD_BYTES / 2);
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const parts = splitBodyByBytes(body, Math.max(1, budget));
+    const lines = parts.map((part, i) => ({ ...base, entry, chunk: i, chunks: parts.length, body: part }));
+    if (lines.every((l) => Buffer.byteLength(JSON.stringify(l), "utf8") + 1 <= MAX_APPEND_RECORD_BYTES)) return lines;
+    budget = Math.floor(budget / 2);
+  }
+  throw new Error("wiki history body could not be split under " + MAX_APPEND_RECORD_BYTES + " bytes");
+}
+function appendWikiHistory(project, kind, id, body, owner) {
+  const file = wikiHistoryPath(project, kind, id);
+  const previous = readWikiHistory(project, kind, id);
+  const at = nowIso();
+  const meta = { at, owner, supersedes: previous.length ? previous[previous.length - 1].fingerprint : void 0 };
+  for (const line of buildWikiHistoryLines(meta, body)) {
+    appendJsonLine(file, line, "wiki history entry for " + kind + ":" + id);
+  }
+}
+function readWikiHistory(project, kind, id) {
+  const file = wikiHistoryPath(project, kind, id);
+  const entries = [];
+  const groups = /* @__PURE__ */ new Map();
+  let order = 0;
+  for (const { value: rec } of readJsonLines(file)) {
+    if (typeof rec.body !== "string" || typeof rec.at !== "string") continue;
+    const owner = ownerOf(rec.owner);
+    const supersedes = typeof rec.supersedes === "string" && rec.supersedes ? rec.supersedes : void 0;
+    if (typeof rec.chunk === "number" && typeof rec.chunks === "number" && typeof rec.entry === "string") {
+      const g = groups.get(rec.entry) ?? { order: order++, at: rec.at, owner, supersedes, total: rec.chunks, parts: /* @__PURE__ */ new Map() };
+      g.parts.set(rec.chunk, rec.body);
+      groups.set(rec.entry, g);
+      continue;
+    }
+    entries.push({ order: order++, at: rec.at, owner, supersedes, body: rec.body, chunks: 1 });
+  }
+  for (const g of groups.values()) {
+    if (g.parts.size !== g.total) continue;
+    let body = "";
+    for (let i = 0; i < g.total; i++) body += g.parts.get(i) ?? "";
+    entries.push({ order: g.order, at: g.at, owner: g.owner, supersedes: g.supersedes, body, chunks: g.total });
+  }
+  entries.sort((a, b) => a.order - b.order);
+  const withFp = entries.map((e) => ({ ...e, fingerprint: entryFingerprint(e.at, e.owner, e.body) }));
+  const indicesByFingerprint = /* @__PURE__ */ new Map();
+  withFp.forEach((e, i) => {
+    const arr = indicesByFingerprint.get(e.fingerprint);
+    if (arr) arr.push(i);
+    else indicesByFingerprint.set(e.fingerprint, [i]);
+  });
+  const hidden = withFp.map(() => false);
+  withFp.forEach((e, i) => {
+    if (!e.supersedes) return;
+    for (const j of indicesByFingerprint.get(e.supersedes) ?? []) if (j < i) hidden[j] = true;
+  });
+  return withFp.map((e, i) => ({ at: e.at, owner: e.owner, supersedes: e.supersedes, body: e.body, fingerprint: e.fingerprint, chunks: e.chunks, superseded: hidden[i] }));
+}
+function renameWithRetry(from, to, attempts = 12) {
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (e) {
+      last = e;
+      const code = String(e?.code ?? "");
+      if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3 + i * 3);
+    }
+  }
+  try {
+    fs.unlinkSync(from);
+  } catch {
+  }
+  throw last;
+}
 function writeWikiPage(project, page) {
   const p = wikiPath(project, page.kind, page.id);
   const fm = [
@@ -168,9 +323,12 @@ function writeWikiPage(project, page) {
     ""
   ].join("\n");
   ensureDir(path.dirname(p));
-  fs.writeFileSync(p, body, "utf8");
+  appendWikiHistory(project, page.kind, page.id, body, ownerOf(page.owner));
+  const tmp = p + "." + process.pid + "." + randomBytes(6).toString("hex") + ".tmp";
+  fs.writeFileSync(tmp, body, "utf8");
+  renameWithRetry(tmp, p);
   const log = path.join(rlabDir(project), "wiki", "log.md");
-  const stamp = (/* @__PURE__ */ new Date()).toISOString();
+  const stamp = nowIso();
   fs.appendFileSync(log, "- " + stamp + "  " + page.kind + ":" + page.id + "  " + page.title.replace(/[\r\n]+/g, " ") + "\n", "utf8");
   return p;
 }
@@ -1113,7 +1271,6 @@ function renderScoop(a) {
 }
 
 // src/extract.ts
-import * as fs3 from "node:fs";
 import * as path3 from "node:path";
 function betaConfidence(prior, cited, weight = 100) {
   return (prior * weight + cited) / (weight + cited);
@@ -1167,48 +1324,103 @@ function extractClaims(text) {
   return claims;
 }
 var claimsFile = (project) => path3.join(project, ".rlab", "claims.jsonl");
-function loadClaims(project) {
-  try {
-    const lines = fs3.readFileSync(claimsFile(project), "utf8").split("\n").filter(Boolean);
-    return lines.map((l) => JSON.parse(l));
-  } catch {
-    return [];
+function readClaimLines(project) {
+  const out = [];
+  for (const { raw, value } of readJsonLines(claimsFile(project))) {
+    if (!value || typeof value !== "object") continue;
+    out.push({ raw, record: value });
   }
+  return out;
 }
-function addClaims(project, docId, text) {
-  const existing = loadClaims(project);
-  let nextId = existing.length ? Math.max(...existing.map((c) => c.id)) + 1 : 1;
-  const fresh = extractClaims(text);
+function supersedeMask(lines) {
+  const live = lines.map(() => true);
+  const indicesByFingerprint = /* @__PURE__ */ new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const fp = lineFingerprint(lines[i].raw);
+    const arr = indicesByFingerprint.get(fp);
+    if (arr) arr.push(i);
+    else indicesByFingerprint.set(fp, [i]);
+    const s = lines[i].record.supersedes;
+    if (!s) continue;
+    for (const j of indicesByFingerprint.get(s) ?? []) if (j < i) live[j] = false;
+  }
+  return live;
+}
+function loadClaims(project, opts = {}) {
+  const lines = readClaimLines(project);
+  const live = supersedeMask(lines);
+  return lines.map((line, i) => ({ line, i })).filter(({ i }) => opts.includeSuperseded === true || live[i]).sort((a, b) => (Number(a.line.record.id) || 0) - (Number(b.line.record.id) || 0) || a.i - b.i).map(({ line }) => line.record);
+}
+function nextClaimId(project) {
+  let max = 0;
+  for (const l of readClaimLines(project)) max = Math.max(max, Number(l.record.id) || 0);
+  return max + 1;
+}
+function appendClaim(project, claim, owner) {
+  const recordedAt = typeof claim.recordedAt === "string" && claim.recordedAt ? claim.recordedAt : nowIso();
+  const cited = Number(claim.cited ?? 0) || 0;
+  const id = Number.isFinite(Number(claim.id)) && Number(claim.id) > 0 ? Number(claim.id) : nextClaimId(project);
+  const record = {
+    id,
+    docId: Number(claim.docId ?? 0) || 0,
+    type: claim.type ?? "contribution",
+    subject: String(claim.subject ?? ""),
+    ...claim.value !== void 0 ? { value: String(claim.value) } : {},
+    ...claim.task !== void 0 ? { task: String(claim.task) } : {},
+    context: String(claim.context ?? ""),
+    cited,
+    confidence: typeof claim.confidence === "number" ? claim.confidence : betaConfidence(0.5, cited),
+    date: typeof claim.date === "string" && claim.date ? claim.date : recordedAt.slice(0, 10),
+    owner: ownerOf(owner ?? claim.owner),
+    recordedAt,
+    ...claim.supersedes ? { supersedes: String(claim.supersedes) } : {}
+  };
+  appendJsonLine(claimsFile(project), record, "claim #" + id);
+  return record;
+}
+function addClaims(project, docId, text, owner) {
+  let nextId = nextClaimId(project);
   const prior = 0.5;
   const added = [];
-  fs3.mkdirSync(path3.dirname(claimsFile(project)), { recursive: true });
-  for (const c of fresh) {
-    const claim = { id: nextId++, docId, ...c, cited: 0, confidence: betaConfidence(prior, 0), date: (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) };
-    fs3.appendFileSync(claimsFile(project), JSON.stringify(claim) + "\n", "utf8");
-    added.push(claim);
+  for (const c of extractClaims(text)) {
+    added.push(appendClaim(project, { id: nextId++, docId, ...c, cited: 0, confidence: betaConfidence(prior, 0) }, owner));
   }
   return added;
 }
-function citeClaim(project, claimId, weight = 100) {
-  const claims = loadClaims(project);
-  const c = claims.find((x) => x.id === claimId);
-  if (!c) return null;
-  c.cited += 1;
-  c.confidence = betaConfidence(0.5, c.cited, weight);
-  fs3.writeFileSync(claimsFile(project), claims.map((x) => JSON.stringify(x)).join("\n") + "\n", "utf8");
-  return c;
+function citeClaim(project, claimId, weight = 100, owner) {
+  const lines = readClaimLines(project);
+  const live = supersedeMask(lines);
+  let pick = -1;
+  for (let i = 0; i < lines.length; i++) if (live[i] && Number(lines[i].record.id) === claimId) pick = i;
+  if (pick < 0) return null;
+  const old = lines[pick].record;
+  const cited = (Number(old.cited) || 0) + 1;
+  const record = {
+    ...old,
+    cited,
+    confidence: betaConfidence(0.5, cited, weight),
+    owner: ownerOf(owner),
+    recordedAt: nowIso(),
+    supersedes: lineFingerprint(lines[pick].raw)
+  };
+  appendJsonLine(claimsFile(project), record, "cite claim #" + claimId);
+  return record;
 }
-function claimsReport(project, type) {
-  const claims = loadClaims(project);
+function claimsReport(project, type, opts = {}) {
+  const claims = loadClaims(project, opts);
   if (!claims.length) return "No claims recorded yet. Use rlab_claim action=extract.";
   const rows = type ? claims.filter((c) => c.type === type) : claims;
   const lines = ["# Claim ledger \u2014 " + project + " (" + rows.length + " claims)", ""];
   for (const c of rows) {
-    lines.push("[" + c.id + "] " + c.type.toUpperCase() + "  conf=" + c.confidence.toFixed(3) + " cited=" + c.cited);
+    lines.push("[" + c.id + "] " + String(c.type ?? "").toUpperCase() + "  conf=" + Number(c.confidence || 0).toFixed(3) + " cited=" + (Number(c.cited) || 0));
     if (c.subject) lines.push("  subject: " + c.subject);
     if (c.value) lines.push("  value: " + c.value + (c.task ? "  on: " + c.task : ""));
-    lines.push('  ctx: "' + c.context.slice(0, 140) + '"');
+    lines.push('  ctx: "' + String(c.context ?? "").slice(0, 140) + '"');
     lines.push("");
+  }
+  if (opts.includeSuperseded !== true) {
+    const hidden = loadClaims(project, { includeSuperseded: true }).length - claims.length;
+    if (hidden > 0) lines.push("_(" + hidden + " superseded version(s) hidden \u2014 rlab_claim action=list includeSuperseded=true shows them)_", "");
   }
   return lines.join("\n");
 }
@@ -1243,19 +1455,19 @@ async function suggestZh(query, max = 5) {
 
 // src/ref.ts
 import { execSync } from "node:child_process";
-import * as fs4 from "node:fs";
+import * as fs3 from "node:fs";
 import * as path4 from "node:path";
 function cloneAndStudy(url, outDir, maxTree = 30) {
   const m = url.match(/github\.com\/([^\/]+)\/([^\/\s]+?)(?:\.git)?(?:\/|$)/);
   if (!m) throw new Error("not a github.com URL: " + url);
   const repo = m[1] + "/" + m[2].replace(/\.git$/, "");
-  fs4.mkdirSync(outDir, { recursive: true });
+  fs3.mkdirSync(outDir, { recursive: true });
   const dir = path4.join(outDir, m[2].replace(/\.git$/, ""));
   execSync("git clone --depth 1 https://github.com/" + repo + '.git "' + dir + '"', { stdio: "pipe", timeout: 12e4 });
   const head = (name2, n = 40) => {
     const f = path4.join(dir, name2);
     try {
-      return fs4.readFileSync(f, "utf8").slice(0, 1800);
+      return fs3.readFileSync(f, "utf8").slice(0, 1800);
     } catch {
       return "";
     }
@@ -1265,7 +1477,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
   const tree = [];
   const walk = (d, depth) => {
     if (depth > 2 || tree.length >= maxTree) return;
-    for (const f of fs4.readdirSync(d, { withFileTypes: true })) {
+    for (const f of fs3.readdirSync(d, { withFileTypes: true })) {
       if (f.name.startsWith(".") || f.name === "node_modules") continue;
       const rel = path4.relative(dir, path4.join(d, f.name));
       tree.push((depth ? "  ".repeat(depth) : "") + rel + (f.isDirectory() ? "/" : ""));
@@ -1275,7 +1487,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
   walk(dir, 0);
   let files = 0;
   const count = (d) => {
-    for (const f of fs4.readdirSync(d, { withFileTypes: true })) {
+    for (const f of fs3.readdirSync(d, { withFileTypes: true })) {
       if (f.name.startsWith(".")) continue;
       if (f.isDirectory()) count(path4.join(d, f.name));
       else files++;
@@ -1314,7 +1526,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
     ""
   ];
   const noteFile = path4.join(dir, "REF.md");
-  fs4.writeFileSync(noteFile, note2.join("\n"), "utf8");
+  fs3.writeFileSync(noteFile, note2.join("\n"), "utf8");
   return { repo, dir, readme, claudeMd, tree, files, noteFile };
 }
 
@@ -1322,7 +1534,7 @@ function cloneAndStudy(url, outDir, maxTree = 30) {
 import * as os2 from "node:os";
 
 // src/cap-index.ts
-import { readFileSync as readFileSync6 } from "node:fs";
+import { readFileSync as readFileSync5 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { join as join7 } from "node:path";
 var MIN_CONTRACT_VERSION = 1;
@@ -1333,7 +1545,7 @@ function resolveEnv(opts = {}) {
   const busDir = join7(dshHome, "session-bus");
   const read = (file) => {
     try {
-      return readFileSync6(join7(busDir, file), "utf8").trim();
+      return readFileSync5(join7(busDir, file), "utf8").trim();
     } catch {
       return "";
     }
@@ -1502,7 +1714,7 @@ function describeAvailability(probe) {
 }
 
 // src/ocr.ts
-import * as fs5 from "node:fs";
+import * as fs4 from "node:fs";
 import * as os from "node:os";
 import * as path5 from "node:path";
 var JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
@@ -1512,7 +1724,7 @@ function ocrToken() {
   if (fromEnv && fromEnv.trim()) return fromEnv.trim();
   const f = path5.join(os.homedir(), ".dsh", "paddle-ocr.token");
   try {
-    const t = fs5.readFileSync(f, "utf8").trim();
+    const t = fs4.readFileSync(f, "utf8").trim();
     if (t) return t;
   } catch {
   }
@@ -1554,7 +1766,7 @@ async function submitLocal(abs, model, token) {
   const fd = new FormData();
   fd.append("model", model);
   fd.append("optionalPayload", JSON.stringify(bestPayload(model)));
-  fd.append("file", new Blob([fs5.readFileSync(abs)]), path5.basename(abs));
+  fd.append("file", new Blob([fs4.readFileSync(abs)]), path5.basename(abs));
   const resp = await fetch(JOB_URL, { method: "POST", headers: { Authorization: "bearer " + token }, body: fd });
   if (resp.status !== 200) throw new Error("submit failed " + resp.status + ": " + (await resp.text()).slice(0, 300).toWellFormed());
   const j = await resp.json();
@@ -1576,13 +1788,13 @@ async function downloadToTemp(file) {
     name2 = name2.replace(/\.[^.]*$/, "") + "." + cext;
   }
   const tmp = path5.join(os.tmpdir(), "rlab-ocr-" + Date.now() + "-" + name2);
-  fs5.writeFileSync(tmp, Buffer.from(await r.arrayBuffer()));
+  fs4.writeFileSync(tmp, Buffer.from(await r.arrayBuffer()));
   return tmp;
 }
 async function submitJob(file, model, token) {
   if (!/^https?:\/\//i.test(file)) {
     const abs = path5.resolve(file);
-    if (!fs5.existsSync(abs)) throw new Error("file not found: " + abs);
+    if (!fs4.existsSync(abs)) throw new Error("file not found: " + abs);
     return submitLocal(abs, model, token);
   }
   const resp = await fetch(JOB_URL, {
@@ -1599,7 +1811,7 @@ async function submitJob(file, model, token) {
     return await submitLocal(tmp, model, token);
   } finally {
     try {
-      fs5.unlinkSync(tmp);
+      fs4.unlinkSync(tmp);
     } catch {
     }
   }
@@ -1625,7 +1837,7 @@ async function runOcr(file, model, opts = {}) {
   throw new Error("OCR job timed out after " + Math.round((Date.now() - started) / 1e3) + "s (job " + jobId + ")");
 }
 async function fetchOcrMarkdown(jsonlUrl, outDir) {
-  fs5.mkdirSync(outDir, { recursive: true });
+  fs4.mkdirSync(outDir, { recursive: true });
   const r = await fetch(jsonlUrl);
   if (!r.ok) throw new Error("result download failed " + r.status);
   const parts = [];
@@ -1649,8 +1861,8 @@ async function fetchOcrMarkdown(jsonlUrl, outDir) {
           const ir = await fetch(url);
           if (ir.ok) {
             const p = path5.join(outDir, rel);
-            fs5.mkdirSync(path5.dirname(p), { recursive: true });
-            fs5.writeFileSync(p, Buffer.from(await ir.arrayBuffer()));
+            fs4.mkdirSync(path5.dirname(p), { recursive: true });
+            fs4.writeFileSync(p, Buffer.from(await ir.arrayBuffer()));
             images++;
           }
         } catch {
@@ -1661,12 +1873,12 @@ async function fetchOcrMarkdown(jsonlUrl, outDir) {
   if (!parts.length) throw new Error("no markdown content in OCR result");
   const mdPath = path5.join(outDir, "doc.md");
   const text = parts.join("\n\n---\n\n");
-  fs5.writeFileSync(mdPath, text, "utf8");
+  fs4.writeFileSync(mdPath, text, "utf8");
   return { mdPath, pages: parts.length, images, chars, text };
 }
 
 // src/validate.ts
-import * as fs6 from "node:fs";
+import * as fs5 from "node:fs";
 import * as path6 from "node:path";
 var KINDS = ["experiment", "literature", "decision", "todo"];
 var REQUIRED_FIELDS = ["id", "kind", "title", "updated"];
@@ -1690,11 +1902,11 @@ function validateWiki(project) {
   const idSet = new Set(pages.map((p) => p.id));
   for (const kind of KINDS) {
     const dir = path6.join(root, kind);
-    if (!fs6.existsSync(dir)) continue;
-    for (const f of fs6.readdirSync(dir)) {
+    if (!fs5.existsSync(dir)) continue;
+    for (const f of fs5.readdirSync(dir)) {
       if (!f.endsWith(".md") || f === "index.md") continue;
       const full = path6.join(dir, f);
-      const text = fs6.readFileSync(full, "utf8");
+      const text = fs5.readFileSync(full, "utf8");
       const id = f.replace(/\.md$/, "");
       const fm = parseFrontmatter2(text);
       if (!fm.ok) {
@@ -1859,7 +2071,8 @@ async function apply(ctx) {
       id: { type: "string", required: true, description: "short kebab id, e.g. m10-contrastive or arxiv-2602.04770" },
       title: { type: "string", required: true, description: "page title" },
       content: { type: "string", required: true, description: "markdown body" },
-      tags: { type: "array", description: "optional tags" }
+      tags: { type: "array", description: "optional tags" },
+      owner: { type: "string", description: "session/agent id of the writer, recorded in <page>.history.jsonl (default: unknown)" }
     },
     output: textOut,
     timeoutMs: 15e3,
@@ -1875,7 +2088,8 @@ async function apply(ctx) {
         title: String(args?.title ?? id),
         updated: today(),
         content: String(args?.content ?? ""),
-        tags: args?.tags
+        tags: args?.tags,
+        owner: args?.owner === void 0 ? void 0 : String(args.owner)
       });
       const idx = rebuildWikiIndex(project);
       let ix = "";
@@ -2074,8 +2288,8 @@ async function apply(ctx) {
       const text = lines.join("\n");
       const outFile = args?.outputFile ? String(args.outputFile) : "";
       if (outFile) {
-        fs7.mkdirSync(path7.dirname(path7.resolve(outFile)), { recursive: true });
-        fs7.writeFileSync(outFile, text + "\n", "utf8");
+        fs6.mkdirSync(path7.dirname(path7.resolve(outFile)), { recursive: true });
+        fs6.writeFileSync(outFile, text + "\n", "utf8");
         return "Review written to " + outFile + "\n\n" + text;
       }
       return text;
@@ -2116,11 +2330,11 @@ async function apply(ctx) {
       all.sort((a, b) => (b.published || "").localeCompare(a.published || ""));
       const date = today();
       const dir = path7.join(rlabDir(project), "digests");
-      fs7.mkdirSync(dir, { recursive: true });
+      fs6.mkdirSync(dir, { recursive: true });
       const file = path7.join(dir, date + ".md");
       const lines = ["# arXiv digest \u2014 " + date, "", "queries: " + queries.join(" | "), "papers: " + all.length, ""];
       lines.push(formatPapers(all, withSummary));
-      fs7.writeFileSync(file, lines.join("\n") + "\n", "utf8");
+      fs6.writeFileSync(file, lines.join("\n") + "\n", "utf8");
       let wikiCount = 0;
       if (args?.wiki === true) {
         const wseen = /* @__PURE__ */ new Set();
@@ -2224,7 +2438,9 @@ async function apply(ctx) {
       text: { type: "string", description: "paper text to extract from (action=extract)" },
       docId: { type: "number", description: "indexed doc id to extract from (action=extract)" },
       claimId: { type: "number", description: "claim id to cite (action=cite)" },
-      type: { type: "string", description: "filter list by claim type" }
+      type: { type: "string", description: "filter list by claim type" },
+      owner: { type: "string", description: "session/agent id of the writer, stored on every record (default: unknown)" },
+      includeSuperseded: { type: "boolean", description: "list: also return versions a later record superseded (default false)" }
     },
     output: textOut,
     timeoutMs: 2e4,
@@ -2232,6 +2448,7 @@ async function apply(ctx) {
       const project = String(args?.project ?? "").trim();
       const action = String(args?.action ?? "").trim();
       if (!project || !action) throw new Error("project and action required");
+      const owner = args?.owner === void 0 ? void 0 : String(args.owner);
       switch (action) {
         case "extract": {
           let docId = 0;
@@ -2244,19 +2461,19 @@ async function apply(ctx) {
             textArg = row.title + " " + row.body;
           }
           if (!textArg.trim()) throw new Error("text or docId required");
-          const added = addClaims(project, docId, textArg);
+          const added = addClaims(project, docId, textArg, owner);
           if (!added.length) return 'No claims matched the templates in this text. Templates: "we propose/present X", "achieves Y on Z", "outperforms W by V" (en+zh).';
-          return "Extracted " + added.length + " claims (confidences beta(0.5, cited=0)):\n\n" + added.map((c) => "[" + c.id + "] " + c.type.toUpperCase() + " conf=" + c.confidence.toFixed(3) + "\n  subject: " + (c.subject || "\u2014") + (c.value ? "  value: " + c.value : "") + (c.task ? "  on: " + c.task : "")).join("\n");
+          return "Extracted " + added.length + " claims (appended to claims.jsonl, confidences beta(0.5, cited=0)):\n\n" + added.map((c) => "[" + c.id + "] " + c.type.toUpperCase() + " conf=" + c.confidence.toFixed(3) + "\n  subject: " + (c.subject || "\u2014") + (c.value ? "  value: " + c.value : "") + (c.task ? "  on: " + c.task : "")).join("\n");
         }
         case "cite": {
           const claimId = Number(args?.claimId);
           if (!claimId) throw new Error("claimId required");
-          const c = citeClaim(project, claimId);
+          const c = citeClaim(project, claimId, 100, owner);
           if (!c) throw new Error("claim #" + claimId + " not found");
           return "Cited claim #" + claimId + " \u2014 confidence " + c.confidence.toFixed(4) + " (cited=" + c.cited + "). beta posterior rises with each citation.";
         }
         case "list":
-          return claimsReport(project, args?.type ? String(args.type) : void 0);
+          return claimsReport(project, args?.type ? String(args.type) : void 0, { includeSuperseded: args?.includeSuperseded === true });
         default:
           throw new Error("action must be extract|cite|list");
       }
@@ -2358,7 +2575,7 @@ async function apply(ctx) {
           const parts = [];
           let added = 0, updated = 0, failed = 0, unchanged = 0, remaining = 0;
           for (const cdir of cands) {
-            if (!fs7.existsSync(cdir)) {
+            if (!fs6.existsSync(cdir)) {
               if (dir) throw new Error("dir not found: " + cdir);
               continue;
             }
@@ -2458,12 +2675,12 @@ async function apply(ctx) {
       const dirs = String(args?.dir ?? "").trim() ? [String(args?.dir).trim()] : [path7.join(project, "batch", "out"), path7.join(project, ".dsh-lib-analyzer", "pages")];
       const seen = /* @__PURE__ */ new Map();
       for (const d of dirs) {
-        if (!fs7.existsSync(d)) continue;
+        if (!fs6.existsSync(d)) continue;
         const walk = (p, depth) => {
           if (depth > 4) return;
           let entries = [];
           try {
-            entries = fs7.readdirSync(p, { withFileTypes: true });
+            entries = fs6.readdirSync(p, { withFileTypes: true });
           } catch {
             return;
           }
@@ -2477,7 +2694,7 @@ async function apply(ctx) {
             if (!f.name.endsWith(".md")) continue;
             let st;
             try {
-              st = fs7.statSync(full);
+              st = fs6.statSync(full);
             } catch {
               continue;
             }
@@ -2496,7 +2713,7 @@ async function apply(ctx) {
         if (absorbed + failed >= max) break;
         if (Date.now() - started > budgetMs) break;
         try {
-          const text = fs7.readFileSync(f.full, "utf8").slice(0, 2e4).toWellFormed();
+          const text = fs6.readFileSync(f.full, "utf8").slice(0, 2e4).toWellFormed();
           const slug = path7.basename(f.full, ".md").replace(/[^\w\u4e00-\u9fff-]+/g, "-").slice(0, 60) || "report";
           const page = writeWikiPage(project, { kind, id: slug, title: slug + " (absorbed)", updated: today(), content: text.slice(0, 5e3) + "\n\n---\nSource: " + f.rel, tags: ["absorb", path7.basename(path7.dirname(f.full))] });
           const before = ledger.get(f.rel);
@@ -2514,7 +2731,7 @@ async function apply(ctx) {
       }
       if (absorbed > 0) mineKeywords(project, 40);
       const remaining = Math.max(0, pending.length - absorbed - failed);
-      return "Absorbed " + absorbed + " report(s) \u2014 " + seen.size + " found, " + unchanged + " unchanged since the last run, " + failed + " failed" + (updatedInPlace > 0 ? ", " + updatedInPlace + " re-indexed in place (the file changed)" : "") + "\nfrom: " + (dirs.filter((d) => fs7.existsSync(d)).join(", ") || "(no dirs)") + "\nwiki pages: " + absorbed + " | related.db docs: " + absorbed + (remaining > 0 ? "\n" + remaining + " still pending \u2014 call again with the same arguments; the ledger skips everything already done." : "\nNothing left to absorb in those directories.");
+      return "Absorbed " + absorbed + " report(s) \u2014 " + seen.size + " found, " + unchanged + " unchanged since the last run, " + failed + " failed" + (updatedInPlace > 0 ? ", " + updatedInPlace + " re-indexed in place (the file changed)" : "") + "\nfrom: " + (dirs.filter((d) => fs6.existsSync(d)).join(", ") || "(no dirs)") + "\nwiki pages: " + absorbed + " | related.db docs: " + absorbed + (remaining > 0 ? "\n" + remaining + " still pending \u2014 call again with the same arguments; the ledger skips everything already done." : "\nNothing left to absorb in those directories.");
     }
   }));
   ctx.tools.register(defineTool({
@@ -2529,7 +2746,7 @@ async function apply(ctx) {
       const project = String(args?.project ?? "").trim();
       if (!project) throw new Error("project required");
       const dir = rlabDir(project);
-      if (!fs7.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
+      if (!fs6.existsSync(dir)) return "No .rlab/ directory at " + project + " yet. Start with rlab_wiki or rlab_bench.";
       const pages = listWiki(project);
       const count = (k) => pages.filter((p) => p.kind === k).length;
       const benchRows = readBench(project);
